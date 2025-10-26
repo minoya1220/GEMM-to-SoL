@@ -1,0 +1,15 @@
+[project]
+name = "gemm-to-sol"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "ninja>=1.13.0",
+    "numpy>=2.3.4",
+    "torch>=2.9.0",
+]
+
+[build-system]
+requires = ["setuptools", "torch"]  # Add torch here, keep existing dependencies
+build-backend = "setuptools.build_meta"
