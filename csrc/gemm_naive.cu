@@ -1,6 +1,8 @@
 #include <torch/extension.h>
+#include "gemm_common.h"
 
-__global__ void gemm_kernel(const float* A, const float* B, float* C, int M, int N, int K) {
+
+__global__ void gemm_naive_kernel(const float* A, const float* B, float* C, int M, int N, int K) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -18,28 +20,15 @@ __global__ void gemm_kernel(const float* A, const float* B, float* C, int M, int
 }
 
 torch::Tensor gemm_naive(torch::Tensor A, torch::Tensor B) {
-    auto M = A.size(-2);
-    auto K = A.size(-1);
-    auto N = B.size(-1);
-
-    TORCH_CHECK(A.dtype() == torch::kFloat32 && B.dtype() == torch::kFloat32, "Incompatible datatype, must be float32");
-    TORCH_CHECK(A.is_cuda() && B.is_cuda(), "Both tensors must be on device");
-    TORCH_CHECK(A.is_contiguous() && B.is_contiguous(), "Both tensors must be contiguous");
-    TORCH_CHECK(K == B.size(-2), "Incompatible dimension: ", K, " does not equal ", B.size(-2));
-
-    auto C = torch::empty({M, N}, A.options());
-    
-    auto A_ = A.data_ptr<float>();
-    auto B_ = B.data_ptr<float>();
-    auto C_ = C.data_ptr<float>();
+    auto t = prep_tensors(A, B);
 
     dim3 block(16, 16);
-    dim3 grid((M + block.x - 1) / block.x, (N + block.y - 1) / block.y); 
+    dim3 grid((t.M + block.x - 1) / block.x, (t.N + block.y - 1) / block.y); 
 
-    gemm_kernel<<<grid, block>>>(A_, B_, C_, M, N, K);
+    gemm_naive_kernel<<<grid, block>>>(t.A, t.B, t.C, t.M, t.N, t.K);
     cudaDeviceSynchronize();
     
-    return C;
+    return t.C_tensor;
 
 }
 
