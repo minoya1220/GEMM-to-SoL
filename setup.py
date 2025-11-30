@@ -15,6 +15,7 @@ setup(
             sources=[
                 'csrc/gemm_naive.cu',
                 'csrc/gemm_tiled.cu',
+                'csrc/gemm_coarsened.cu',
                 'csrc/bindings.cpp' 
             ],
             extra_compile_args={

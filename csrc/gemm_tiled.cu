@@ -14,8 +14,6 @@ __global__ void gemm_tiled_kernel(const float* A, const float* B, float* C, int 
     int tidy = threadIdx.y;
     // int tid = tidy * bdimx * tidx;
     
-    // TODO: reduce the K dim tile size and increase M & N to increase arithmetic intensity
-    // also use linear thread idx for loading and have more than one output element per thread
     
     // Layouts
     // A (M, K) : (K, 1)
@@ -25,7 +23,6 @@ __global__ void gemm_tiled_kernel(const float* A, const float* B, float* C, int 
     __shared__ float tileA[TILE_SIZE * TILE_SIZE]; // Block M * Block K
     __shared__ float tileB[TILE_SIZE * TILE_SIZE]; // Block K * Block N 
     
-    __syncthreads();
     
     float accum = 0;
     for (int kt = 0; kt < K; kt += TILE_SIZE) {
