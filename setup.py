@@ -16,6 +16,10 @@ setup(
                 'csrc/gemm_naive.cu',
                 'csrc/gemm_tiled.cu',
                 'csrc/gemm_coarsened.cu',
+                'csrc/gemm_vectorized.cu',
+                'csrc/gemm_double_buffered.cu',
+                'csrc/gemm_swizzled.cu',
+                'csrc/gemm_transposed.cu',
                 'csrc/bindings.cpp' 
             ],
             extra_compile_args={

@@ -7,5 +7,7 @@ wheels/
 *.so
 *.egg-info
 
+*.ncu-rep
+
 # Virtual environments
 .venv

@@ -21,6 +21,16 @@ inline gemm_setup_t prep_tensors(torch::Tensor A, torch::Tensor B) {
     TORCH_CHECK(A.is_cuda() && B.is_cuda(), "Both tensors must be on device");
     TORCH_CHECK(A.is_contiguous() && B.is_contiguous(), "Both tensors must be contiguous");
     TORCH_CHECK(out.K == B.size(-2), "Incompatible dimension: ", out.K, " does not equal ", B.size(-2));
+
+    if (out.M % 4 != 0 || out.N % 4 != 0 || out.K % 4 != 0) {
+        // create padding for matrices that arent divisible by 4
+        int64_t m_padding = (4 - out.M % 4) % 4;
+        int64_t n_padding = (4 - out.N % 4) % 4;
+        int64_t k_padding = (4 - out.K % 4) % 4;
+        namespace F = torch::nn::functional;
+        A = F::pad(A, F::PadFuncOptions({0, k_padding, 0, m_padding}).value(0));
+        B = F::pad(B, F::PadFuncOptions({0, n_padding, 0, k_padding}).value(0));
+    }
     
     out.C_tensor = torch::empty({out.M, out.N}, A.options());
     

@@ -22,11 +22,11 @@ def test(A, B, func: Callable):
 
 def benchmark(M, N, K, func: Callable):
     # warmup
-    for _ in range(0,5): 
+    for _ in range(0,20): 
         func()
     
     times = []
-    for _ in range(0,10):
+    for _ in range(0,100):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
 
@@ -70,8 +70,8 @@ def plot( func: Callable):
 
 
 if __name__ == "__main__":
-    M = N = 1024
-    K = 2048
+    M = N = 4096
+    K = 4096
 
     A = torch.rand(M, K, device='cuda')
     B = torch.rand(K, N, device='cuda')
@@ -80,10 +80,12 @@ if __name__ == "__main__":
     # benchmark(M, N, K, partial(gemm.gemm_naive, A, B))
     # plot(gemm.gemm_naive)
 
+    func = gemm.gemm_double_buffered
 
-    test(A, B, partial(gemm.gemm_tiled, A, B))
-    benchmark(M, N, K, partial(gemm.gemm_tiled, A, B))
-    plot(gemm.gemm_tiled)
+    # func(A, B)
+    # test(A, B, partial(func, A, B))
+    benchmark(M, N, K, partial(func, A, B))
+    # plot(func)
     
 
     # benchmark(M, N, K, partial(torch.matmul, A, B))
