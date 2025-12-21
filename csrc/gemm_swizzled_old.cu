@@ -2,10 +2,11 @@
 #include "gemm_common.h"
 
 constexpr int WARP_SIZE = 32; // constant for all nvidia gpus
-constexpr int BDIM = 256; 
+constexpr int BDIM = 256;
+constexpr int WARPS_PER_BLOCK = BDIM / WARP_SIZE;
 
 constexpr int BLK_M = 128; // block sizes along each dimension
-constexpr int BLK_N = BLK_M;  // TODO: Reduce one dim to 64 along with using BDIM 128 to reduce register pressure
+constexpr int BLK_N = 128; 
 constexpr int BLK_K = 8; // small K and larger M and N boosts arithmetic intensity
 constexpr int FRAG_SIZE = 8;
 
@@ -16,20 +17,18 @@ constexpr int WARP_TILE_H = BLK_M / (BDIM / WARP_SIZE / WARP_PER_ROW); // (NUM_W
 
 constexpr int T_PER_WTILE_ROW = WARP_TILE_W / FRAG_SIZE;
 
-
-// Using swizzle formula from https://leimao.github.io/blog/CUDA-Shared-Memory-Swizzling/
-__device__ __forceinline__ int swizzleA(int row, int col){
-    return row * BLK_M + (col ^ (row << 2));
+__device__ __forceinline__ int swizzle_A(int row, int col) {
+    return row * BLK_K + (col ^ ((row >> 2) & 0b111));
 }
 
-__global__ void __launch_bounds__(BDIM, 2) gemm_swizzled_kernel(const float* A, const float* B, float* C, int M, int N, int K) {
+__global__ __launch_bounds__(BDIM, 2) void gemm_swizzled_old_kernel(const float* A, const float* B, float* C, int M, int N, int K) {
     int bid = blockIdx.x;
     int tid = threadIdx.x;
     int warp_id = tid / WARP_SIZE;
     int lane_id = tid % WARP_SIZE;
     int m_blks = (M + BLK_M - 1) / BLK_M;
     int n_blks = (N + BLK_N - 1) / BLK_N;  
-    __shared__ float tileA[2][BLK_K * BLK_M]; // 128 x 8
+    __shared__ float tileA[2][BLK_M * BLK_K]; // 128 x 8
     __shared__ float tileB[2][BLK_K * BLK_N]; // 8 x 128
     int read = 0;
     int write = 1;
@@ -51,10 +50,11 @@ __global__ void __launch_bounds__(BDIM, 2) gemm_swizzled_kernel(const float* A, 
     bool maskB_0 = idx / BLK_N < K && nt + idx % BLK_N < N;
     float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 firstA = maskA_0 ? __ldcg((float4*)&A[(mt + idx / BLK_K) * K + (idx % BLK_K)]) : zero; // (m index) * K + (k index)
-    tileA[0][swizzleA((idx % BLK_K),     (idx / BLK_K))] = firstA.x; // transpose A while storing
-    tileA[0][swizzleA((idx % BLK_K + 1), (idx / BLK_K))] = firstA.y;
-    tileA[0][swizzleA((idx % BLK_K + 2), (idx / BLK_K))] = firstA.z;
-    tileA[0][swizzleA((idx % BLK_K + 3), (idx / BLK_K))] = firstA.w;
+    tileA[0][(swizzle_A(idx / BLK_K, idx % BLK_K))] = firstA.x;
+    tileA[0][(swizzle_A(idx / BLK_K, idx % BLK_K + 1))] = firstA.y;
+    tileA[0][(swizzle_A(idx / BLK_K, idx % BLK_K + 2))] = firstA.z;
+    tileA[0][(swizzle_A(idx / BLK_K, idx % BLK_K + 3))] = firstA.w;
+
     *(float4*)&tileB[0][idx] = maskB_0 ? __ldcg((float4*)&B[(idx / BLK_N) * N + (nt + idx % BLK_N)]) : zero;
 
     __syncthreads();
@@ -75,9 +75,12 @@ __global__ void __launch_bounds__(BDIM, 2) gemm_swizzled_kernel(const float* A, 
             float fragB[FRAG_SIZE];
 
             // Load from SMEM to registers
-            *(float4*)&fragA[0] = *(float4*)&tileA[read][swizzleA(k, tile_offset_m)];
-            *(float4*)&fragA[4] = *(float4*)&tileA[read][swizzleA(k, tile_offset_m + WARP_TILE_H/2)];
-           
+            #pragma unroll
+            for (int i = 0; i < FRAG_SIZE/2; i++) {
+                fragA[i] = tileA[read][swizzle_A(tile_offset_m + i, k)];
+                fragA[i + 4] = tileA[read][swizzle_A(tile_offset_m + i + WARP_TILE_H/2, k)];
+
+            }
             *(float4*)&fragB[0] = *(float4*)&tileB[read][(k) * BLK_N + (tile_offset_n)];
             *(float4*)&fragB[4] = *(float4*)&tileB[read][(k) * BLK_N + (tile_offset_n + WARP_TILE_W/2)];
 
@@ -95,13 +98,11 @@ __global__ void __launch_bounds__(BDIM, 2) gemm_swizzled_kernel(const float* A, 
         }
 
         // Store next iterations GMEM load into SMEM
-        
-        tileA[write][swizzleA((idx % BLK_K), (idx / BLK_K))]     = nextA.x; // transpose A tile while storing
-        tileA[write][swizzleA((idx % BLK_K + 1), (idx / BLK_K))] = nextA.y;
-        tileA[write][swizzleA((idx % BLK_K + 2), (idx / BLK_K))] = nextA.z;
-        tileA[write][swizzleA((idx % BLK_K + 3), (idx / BLK_K))] = nextA.w;
-
-
+        // tileA stores are now scalar because of swizzling
+        tileA[write][(swizzle_A(idx / BLK_K, idx % BLK_K))] = nextA.x;
+        tileA[write][(swizzle_A(idx / BLK_K, idx % BLK_K + 1))] = nextA.y;
+        tileA[write][(swizzle_A(idx / BLK_K, idx % BLK_K + 2))] = nextA.z;
+        tileA[write][(swizzle_A(idx / BLK_K, idx % BLK_K + 3))] = nextA.w;
         *(float4*)&tileB[write][idx] = nextB;
 
         // swap read and write buffers
@@ -123,16 +124,15 @@ __global__ void __launch_bounds__(BDIM, 2) gemm_swizzled_kernel(const float* A, 
     }
 }
 
-torch::Tensor gemm_swizzled(torch::Tensor A, torch::Tensor B) {
+torch::Tensor gemm_swizzled_old(torch::Tensor A, torch::Tensor B) {
     auto t = prep_tensors(A, B);
 
     dim3 block(BDIM);
     dim3 grid(((t.M + BLK_M - 1) / BLK_M) * ((t.N + BLK_N - 1) / BLK_N)); 
 
-    gemm_swizzled_kernel<<<grid, block>>>(t.A, t.B, t.C, t.M, t.N, t.K);
+    gemm_swizzled_old_kernel<<<grid, block>>>(t.A, t.B, t.C, t.M, t.N, t.K);
     cudaDeviceSynchronize();
     
     return t.C_tensor;
 
 }
-

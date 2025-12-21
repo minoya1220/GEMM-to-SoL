@@ -80,7 +80,7 @@ if __name__ == "__main__":
     # benchmark(M, N, K, partial(gemm.gemm_naive, A, B))
     # plot(gemm.gemm_naive)
 
-    func = gemm.gemm_double_buffered
+    func = gemm.gemm_swizzled
 
     # func(A, B)
     # test(A, B, partial(func, A, B))
