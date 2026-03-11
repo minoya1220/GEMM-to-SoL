@@ -22,8 +22,8 @@ inline gemm_setup_t prep_tensors(torch::Tensor A, torch::Tensor B) {
     TORCH_CHECK(A.is_contiguous() && B.is_contiguous(), "Both tensors must be contiguous");
     TORCH_CHECK(out.K == B.size(-2), "Incompatible dimension: ", out.K, " does not equal ", B.size(-2));
 
+    // create padding for matrices that arent divisible by 4 for simplicity, not needed for kernels before vectorized
     if (out.M % 4 != 0 || out.N % 4 != 0 || out.K % 4 != 0) {
-        // create padding for matrices that arent divisible by 4
         int64_t m_padding = (4 - out.M % 4) % 4;
         int64_t n_padding = (4 - out.N % 4) % 4;
         int64_t k_padding = (4 - out.K % 4) % 4;

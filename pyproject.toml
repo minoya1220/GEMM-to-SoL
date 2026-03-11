@@ -8,6 +8,7 @@ dependencies = [
     "matplotlib>=3.10.7",
     "ninja>=1.13.0",
     "numpy>=2.3.4",
+    "nvidia-ml-py>=13.590.44",
     "torch>=2.9.0",
 ]
 

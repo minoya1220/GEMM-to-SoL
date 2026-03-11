@@ -13,15 +13,15 @@ setup(
         CUDAExtension(
             name='gemm',
             sources=[
-                'csrc/gemm_naive.cu',
-                'csrc/gemm_tiled.cu',
-                'csrc/gemm_coarsened.cu',
-                'csrc/gemm_vectorized.cu',
-                'csrc/gemm_double_buffered.cu',
-                'csrc/gemm_swizzled_old.cu',
-                'csrc/gemm_transposed.cu',
-                'csrc/gemm_swizzled.cu',
-                'csrc/bindings.cpp' 
+                'csrc/1_gemm_naive.cu',
+                'csrc/2_gemm_tiled.cu',
+                'csrc/3_gemm_register_blocked.cu',
+                'csrc/4_gemm_warptiled.cu',
+                'csrc/5_gemm_vectorized.cu',
+                'csrc/6_gemm_double_buffered.cu',
+                'csrc/7_gemm_transposed.cu',
+                'csrc/8_gemm_swizzled.cu',
+                'csrc/bindings.cpp'
             ],
             extra_compile_args={
                 'nvcc': [

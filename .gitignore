@@ -7,7 +7,12 @@ wheels/
 *.so
 *.egg-info
 
+# profiler outputs
 *.ncu-rep
+*.nsys-rep
+*.qdstrm
+*.json
+profiles
 
 # Virtual environments
 .venv
