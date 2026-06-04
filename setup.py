@@ -1,14 +1,15 @@
 import os
+
 os.environ['CC'] = 'gcc'
 os.environ['CXX'] = 'g++'
 os.environ['CUDAHOSTCXX'] = 'g++'
-
 
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 setup(
     name='gemm',
+    packages=[],
     ext_modules=[
         CUDAExtension(
             name='gemm',
@@ -21,10 +22,12 @@ setup(
                 'csrc/6_gemm_double_buffered.cu',
                 'csrc/7_gemm_transposed.cu',
                 'csrc/8_gemm_swizzled.cu',
+                'csrc/9_gemm_final.cu',
                 'csrc/bindings.cpp'
             ],
             extra_compile_args={
                 'nvcc': [
+                    '-O3',
                     '-gencode=arch=compute_75,code=sm_75',  # T4 only
                 ]
             }

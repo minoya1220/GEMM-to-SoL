@@ -146,14 +146,10 @@ if __name__ == "__main__":
     M = N = 4096
     K = 4096
 
-    A = torch.rand(M, K, device='cuda')
-    B = torch.rand(K, N, device='cuda')
+    A = torch.randn(M, K, device='cuda')
+    B = torch.randn(K, N, device='cuda')
 
-    # test(M, N, K, partial(gemm.gemm_naive, A, B))
-    # benchmark(M, N, K, partial(gemm.gemm_naive, A, B))
-    # plot(gemm.gemm_naive)
-
-    func = gemm.gemm_swizzled
+    func = gemm.gemm_warptiled
     func2 = torch.matmul
     # func(A, B)
     # test(A, B, partial(func, A, B))
@@ -162,8 +158,8 @@ if __name__ == "__main__":
     # time.sleep(100)
     # benchmark_clock(M, N, K, partial(func2, A, B))
     # time.sleep(100)
-    # benchmark(M, N, K, partial(func, A, B), print_results=True)
-    benchmark_clock(M, N, K, partial(func, A, B), print_results=True)
+    benchmark(M, N, K, partial(func, A, B), warmup=0,iters=1,print_results=True)
+    # benchmark_clock(M, N, K, partial(func2, A, B), print_results=True)
     
 
 

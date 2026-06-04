@@ -9,9 +9,9 @@ dependencies = [
     "ninja>=1.13.0",
     "numpy>=2.3.4",
     "nvidia-ml-py>=13.590.44",
-    "torch>=2.9.0",
+    "torch>=2.10.0",
 ]
 
 [build-system]
-requires = ["setuptools", "torch"]  # Add torch here, keep existing dependencies
+requires = ["setuptools", "torch", "ninja"]  # Add torch here, keep existing dependencies
 build-backend = "setuptools.build_meta"

@@ -19,7 +19,6 @@ constexpr int T_PER_WTILE_ROW = WARP_TILE_N / FRAG_SIZE;
 
 
 
-
 __global__ void gemm_vectorized_kernel(const float* A, const float* B, float* C, int M, int N, int K) {
     int bid = blockIdx.x;
     int tid = threadIdx.x;
@@ -42,7 +41,7 @@ __global__ void gemm_vectorized_kernel(const float* A, const float* B, float* C,
     int nt = bid % num_blks_n * TILE_N; // n tile idx
     for (int kt = 0; kt < K; kt += TILE_K) {
         // Load from GMEM to SMEM
-        int idx = tid * 4;
+        int idx = tid * 4; // every 4th idx is converted to float4
         bool maskA = mt + idx / TILE_K < M && kt + idx % TILE_K < K;
         bool maskB = kt + idx / TILE_N < K && nt + idx % TILE_N < N;
         const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);

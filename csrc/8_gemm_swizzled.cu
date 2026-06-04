@@ -21,7 +21,7 @@ __device__ __forceinline__ int swizzleA(int row, int col){
     return row * TILE_M + (col ^ (row << 2));
 }
 
-__global__ void gemm_swizzled_kernel(const float* A, const float* B, float* C, int M, int N, int K) {
+__global__ void gemm_swizzled_kernel(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int M, int N, int K) {
     int bid = blockIdx.x;
     int tid = threadIdx.x;
     int warp_id = tid / WARP_SIZE;
@@ -70,7 +70,7 @@ __global__ void gemm_swizzled_kernel(const float* A, const float* B, float* C, i
         #pragma unroll
         for (int k = 0; k < TILE_K; k++) {
             int kv = k;
-            asm volatile("" : "+r"(kv));
+            asm("" : "+r"(kv)); 
             float fragA[FRAG_SIZE];
             float fragB[FRAG_SIZE];
 
