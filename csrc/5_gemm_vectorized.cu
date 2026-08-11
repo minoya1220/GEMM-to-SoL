@@ -29,8 +29,8 @@ __global__ void gemm_vectorized_kernel(const float* A, const float* B, float* C,
     int tile_offset_m = warp_id / WARP_PER_ROW * WARP_TILE_M + lane_id / T_PER_WTILE_ROW * FRAG_SIZE/2;
     int tile_offset_n = warp_id % WARP_PER_ROW * WARP_TILE_N + lane_id % T_PER_WTILE_ROW * FRAG_SIZE/2;
     
-    __shared__ float tileA[TILE_M * TILE_K]; // 128 x 8
-    __shared__ float tileB[TILE_K * TILE_N]; // 8 x 128
+    __shared__ __align__(16) float tileA[TILE_M * TILE_K]; // 128 x 8
+    __shared__ __align__(16) float tileB[TILE_K * TILE_N]; // 8 x 128
 
     
     float output[4][FRAG_SIZE/2][FRAG_SIZE/2] = {0}; // if we stride our output tiles well be able to coalesce our store

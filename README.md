@@ -470,10 +470,13 @@ __global__ void gemm_warptiled_kernel(const float* A, const float* B, float* C, 
 ## Vectorized
 Looking back at the PTX the compiler generated for the previous kernel, the load/store instructions that the compiler emitted are `ld.global.f32` and `st.shared.f32`. Although by default the compiler will emit these 32-bit load/stores, the gpu can also do 64-bit or 128-bit contiguous load/stores. For our 32-bit floats that means we can load/store either 2 or 4 elements with a single vectorized instruction. This is helpful because if issuing ld/st instructions is throttling our kernel, we can use vectorized instructions to alleviate that bottleneck.
 
-%% INSERT DIAGRAM FOR VECTORIZED HERE %%%
+<div align="center">
+    <img src="diagrams/scalar vs vectorization.svg" width="600">
+    <br>
+</div>
 
 If we want to make the most of the available GMEM bandwidth, we can use a coalesced memory access pattern. An access pattern is usually considered coalesced when adjacent threads from the same warp access adjacent contiguous data in a single instruction. This was necessary on extremely old gpus (GT80/GT200) because the hardware had a unit that would merge memory transactions from multiple threads only if the adjacent threads accessed adjacent data. On modern gpus, data is accessed in 128 byte cache lines*. To get the maximum bandwidth usage, all of the threads collectively have to access all of the values in all of the loaded cache line(s) in a single instruction. The thread ordering doesn't matter, as long as the entire cache line is used in a single instruction we get the max bandwidth. 
-
+%% add note about hardware alignment on cache line boundary %%
 <div align="center">
     <img src="diagrams/coalescing.svg" width="600">
     <br>
@@ -511,20 +514,30 @@ Before we make changes, we should review the Nsight Compute profile of the previ
 
 For a kernel thats trying to be compute bound, the three good types of states are Stall Math Pipe Throttle (this increases as we get more compute bound), Selected (this means the sampled warp was executing an instruction), and Not Selected (the scheduler chose a different warp to run). Ideally, we minimize every other warp state. 
 
-For this kernel we will be focusing mainly on reducing MIO throttle stalls. MIO throttle stalls occur when theres too many memory operations waiting to be dispatched in the hardware queue. The warp stalls until a slot frees up in the queue. Vectorization is perfect for this since it lets us load the same amount of data with fewer memory operations. So if we do 128 bit load/stores instead of the standard 32 bit ones, we would do 1/4 the amount of memory operations for the same amount of data transferred meaning that the queue will be full less often. 
+In this kernel, the main optimization will be reducing MIO throttle stalls. MIO throttle stalls occur when theres too many memory operations waiting to be dispatched in the hardware queue. The warp stalls until a slot frees up in the queue. Vectorization is perfect for this since it lets us load the same amount of data with fewer memory operations. So if we do 128 bit load/stores instead of the standard 32 bit ones, we would do 1/4 the amount of memory operations for the same amount of data transferred meaning that the queue will be full less often. 
 
 There are two main approaches to implementing vectorization in cuda. We can either write in the vectorized ptx as inline assembly or we can use a packed dtype like float4 or int4 where 4 float32s/int32s are stored in one variable. We'll stick with float4s since we are using float32s. Inline ptx loads are more commonly used for lower precision data types.
 
 Here's a sample line for loading from the vectorized kernel:
 ```cpp
-// __shared__ float tileA[TILE_M * TILE_K]; <-- tileA instantiation for context
+// __shared__ __align__(16) float tileA[TILE_M * TILE_K]; <-- tileA instantiation for context
 *(float4*)&tileA[idx] = maskA ? __ldcg((float4*)&A[(mt + idx / TILE_K) * K + (kt + idx % TILE_K)]) : zero; // (m index) * K + (k index)
 ```
-`*(float4*)&`† before the `tileA` and `A` arrays effectively reinterpret casts the float array into a float4 array while letting us keep standard float indexing*. The `__ldcg()` load function is a function built into CUDA which when compiled turns into this PTX instruction `ld.global.cg.v4.f32`. The `.cg` part is the cache hint that the intrinsic function adds.
+`*(float4*)&`† before the `tileA` and `A` arrays effectively reinterpret casts the float array into a float4 array while letting us keep standard float indexing*. `__align__(16)` enforces that the address of the base of the array is divisible by 16. We need this because our 128 bit (16 byte) vectorized load instructions require 16 byte hardware alignment. The `__ldcg()` load function is a function built into CUDA which when compiled turns into this PTX instruction (which can inlined directly too) `ld.global.cg.v4.f32`. The `.cg` part is the cache hint thats added by the instrinsic function which is short for "cache global"‡ meaning that we only cache in the L2 cache skipping storing in the L1 cache. I chose to do it this way for educational purposes. On this kernel, I expect no meaningful performance difference since we don't rely on L1 at all, but it's good practice for when you do need to keep caches clean on more demanding kernels. 
 
-†syntactically we are taking the pointer of the value at the given index, `&`, and then casting that pointer to float4, `(float4*)`,  and finally we dereference `*`
+<sup>† syntactically we are taking the pointer of the value at the given index, `&`, and then casting that pointer to float4, `(float4*)`, and finally we dereference `*` <br>
+\* float4 requires you to divide indices by 4 before accessing <br>
+‡ The global is referring to the scope of the L2. L2 is "global" to the gpu</sup>
 
-*float4 requires you to divide indices by 4 before accessing
+For loading the access pattern is also coalesced because we maintain the rules of each warp utilizing the full loaded cache line in a single load instruction. The storing is still not fully coalesced after vectorization because before 8 contiguous elements were being loaded in separate instruction and now 2 contiguous 4-element vectors are being loaded in separate instructions. If we want to make our stores also coalesced, we can reassign the thread output tiles into split strided tiles so contiguous elements in a cache line are no longer loaded in separate instructions. 
+
+This creates our final tiling strategy:
+<div align="center">
+    <img src="diagrams/vectorized.svg" width="600">
+    <br>
+</div>
+
+Splitting it along the M dimension is optional here since iterating along it is already strided by N. The improvement comes from splitting the contiguous N dimension. 
 ## Double Buffered
 
 

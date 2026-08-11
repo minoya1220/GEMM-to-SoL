@@ -23,8 +23,8 @@ __global__ void gemm_transposed_kernel(const float* A, const float* B, float* C,
     int tid = threadIdx.x;
     int warp_id = tid / WARP_SIZE;
     int lane_id = tid % WARP_SIZE;
-    __shared__ float tileA[2][TILE_M * TILE_K]; // 128 x 8
-    __shared__ float tileB[2][TILE_K * TILE_N]; // 8 x 128
+    __shared__ __align__(16) float tileA[2][TILE_M * TILE_K]; // 128 x 8
+    __shared__ __align__(16) float tileB[2][TILE_K * TILE_N]; // 8 x 128
     int read = 0;
     int write = 1;
 
