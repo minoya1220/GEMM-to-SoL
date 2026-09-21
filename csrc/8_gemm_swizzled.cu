@@ -21,7 +21,7 @@ __device__ __forceinline__ int swizzleA(int row, int col){
     return row * TILE_M + (col ^ (row << 2));
 }
 
-__global__ void gemm_swizzled_kernel(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int M, int N, int K) {
+__global__ void cutlass_gemm_swizzled_kernel(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int M, int N, int K) {
     int bid = blockIdx.x;
     int tid = threadIdx.x;
     int warp_id = tid / WARP_SIZE;
@@ -129,7 +129,7 @@ torch::Tensor gemm_swizzled(torch::Tensor A, torch::Tensor B) {
     dim3 block(BDIM);
     dim3 grid(((t.M + TILE_M - 1) / TILE_M) * ((t.N + TILE_N - 1) / TILE_N)); 
 
-    gemm_swizzled_kernel<<<grid, block>>>(t.A, t.B, t.C, t.M, t.N, t.K);
+    cutlass_gemm_swizzled_kernel<<<grid, block>>>(t.A, t.B, t.C, t.M, t.N, t.K);
     cudaDeviceSynchronize();
     
     return t.C_tensor;

@@ -33,7 +33,7 @@ __global__ void gemm_vectorized_kernel(const float* A, const float* B, float* C,
     __shared__ __align__(16) float tileB[TILE_K * TILE_N]; // 8 x 128
 
     
-    float output[4][FRAG_SIZE/2][FRAG_SIZE/2] = {0}; // if we stride our output tiles well be able to coalesce our store
+    float __align__(16) output[4][FRAG_SIZE/2][FRAG_SIZE/2] = {0}; // if we stride our output tiles well be able to coalesce our store
 
     
     int num_blks_n = (N + TILE_N - 1) / TILE_N;  
@@ -66,7 +66,7 @@ __global__ void gemm_vectorized_kernel(const float* A, const float* B, float* C,
 
             }
             *(float4*)&fragB[0] = *(float4*)&tileB[(k) * TILE_N + (tile_offset_n)];
-            *(float4*)&fragB[4] = *(float4*)&tileB[(k) * TILE_N + (tile_offset_n + WARP_TILE_N/2)];
+            *(float4*)&fragB[4] = *(float4*)&tileB[(k) * TILE_N + (tile_offset_n + WARP_TILE_N/2)]; // ?? just update i to go to 8
 
             // compute outer product (matmul for our two fragments)
             #pragma unroll

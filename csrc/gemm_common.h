@@ -6,7 +6,7 @@ struct gemm_setup_t {
     float* A;
     float* B;
     float* C;
-    torch::Tensor C_tensor;
+    torch::Tensor A_tensor, B_tensor, C_tensor;
     int64_t M, N, K;
 };
 
@@ -17,6 +17,8 @@ inline gemm_setup_t prep_tensors(torch::Tensor A, torch::Tensor B) {
     out.K = A.size(-1);
     out.N = B.size(-1);
     
+    TORCH_CHECK(A.defined() && B.defined(), "undefined tensor");
+    TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "expected 2D");
     TORCH_CHECK(A.dtype() == torch::kFloat32 && B.dtype() == torch::kFloat32, "Incompatible datatype, must be float32");
     TORCH_CHECK(A.is_cuda() && B.is_cuda(), "Both tensors must be on device");
     TORCH_CHECK(A.is_contiguous() && B.is_contiguous(), "Both tensors must be contiguous");
@@ -32,6 +34,8 @@ inline gemm_setup_t prep_tensors(torch::Tensor A, torch::Tensor B) {
         B = F::pad(B, F::PadFuncOptions({0, n_padding, 0, k_padding}).value(0));
     }
     
+    out.A_tensor = A;
+    out.B_tensor = B;
     out.C_tensor = torch::empty({out.M, out.N}, A.options());
     
     out.A = A.data_ptr<float>();
@@ -39,5 +43,6 @@ inline gemm_setup_t prep_tensors(torch::Tensor A, torch::Tensor B) {
     out.C = out.C_tensor.data_ptr<float>();
 
     return out;
+
 }
 

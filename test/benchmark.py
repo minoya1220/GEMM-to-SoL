@@ -66,9 +66,9 @@ def benchmark_clock(M, N, K, func: Callable, warmup=20, iters=100, print_results
         func()
     torch.cuda.synchronize()
 
-    clock_thread.start()
     clocks = []
     times = []
+    clock_thread.start()
     for _ in range(0,iters):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
@@ -145,11 +145,11 @@ def plot(func: Callable):
 if __name__ == "__main__":
     M = N = 4096
     K = 4096
-
     A = torch.randn(M, K, device='cuda')
     B = torch.randn(K, N, device='cuda')
 
-    func = gemm.gemm_warptiled
+    func = gemm.gemm_final
+
     func2 = torch.matmul
     # func(A, B)
     # test(A, B, partial(func, A, B))
@@ -158,9 +158,12 @@ if __name__ == "__main__":
     # time.sleep(100)
     # benchmark_clock(M, N, K, partial(func2, A, B))
     # time.sleep(100)
-    benchmark(M, N, K, partial(func, A, B), warmup=0,iters=1,print_results=True)
-    # benchmark_clock(M, N, K, partial(func2, A, B), print_results=True)
+    # benchmark(M, N, K, partial(func, A, B), warmup=20,iters=100,print_results=True)
+    benchmark_clock(M, N, K, partial(func, A, B), print_results=True)
     
+# sudo $(which ncu) --set full -f -o profiles/final_no_manual_pipeline -k regex:gemm --launch-skip 20 --launch-count 5 uv run test/benchmark.py
+# BUILD WITH --no-build-isolation
+#
 
-
+# uv pip install -e . --no-build-isolation && uv run test/benchmark.py && sudo $(which ncu) --set full -f -o profiles/final_vE -k regex:gemm --launch-skip 20 --launch-count 1 uv run test/benchmark.py
 

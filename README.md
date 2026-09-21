@@ -16,7 +16,7 @@ for(int m = 0; m < M; m++) {     // } these loops get parallelized in the kernel
 }
 ```
 
-Using input matrices A (dims: M,K) and B (dims: K,N) we can create an output matrix C (dims: M,N) where each C output element (m,n) we compute the dot product along the shared k dimension of matrices A and B.
+Using input matrices A (shape: (M, K)) and B (shape: (K, N)) we can create an output matrix C (shape: (M, N)) where each C output element (m,n) we compute the dot product along the shared k dimension of matrices A and B.
 
 <div align="center">
     <br>
@@ -68,11 +68,14 @@ We also have a thread local sum variable which keeps the sum in a register until
 ### Kernel Launch Code:
 
 ```C++
-torch::Tensor gemm_naive(torch::Tensor A, torch::Tensor B) {
-    auto t = prep_tensors(A, B); // creates output tensor, checks dtype, contiguity, gets pointers, and gets M, N, K
 
-    dim3 block(16, 16);
-    dim3 grid((t.M + block.x - 1) / block.x, (t.N + block.y - 1) / block.y); // (a + b - 1) / b is the ceiling division operation where instead of having a remainder, we round up to the nearest multiple of b
+torch::Tensor gemm_naive(torch::Tensor A, torch::Tensor B) {
+    // creates output tensor, checks dtype, contiguity, gets pointers, and gets M, N, K
+    auto t = prep_tensors(A, B); // check
+
+    dim3 block(NUM_THREADS); // NUM_THREADS = 256
+    dim3 grid((t.M * t.N + NUM_THREADS - 1) / NUM_THREADS); 
+    // (A + B - 1) / B is ceiling division
 
     gemm_naive_kernel<<<grid, block>>>(t.A, t.B, t.C, t.M, t.N, t.K);
     cudaDeviceSynchronize();
@@ -80,6 +83,7 @@ torch::Tensor gemm_naive(torch::Tensor A, torch::Tensor B) {
     return t.C_tensor;
 
 }
+
 ```
 
 This our Kernel Launch code, it won't change much throughout the series. The main things to note are that we have chosen to have thread blocks that are 16x16 (256) threads large and that we are doing ceiling division so that we pad with extra threads in case our matrices have a dimension that is not divisible by block size. It is important that we keep our parameters either powers of 2 or multiples of high powers of 2 even if it means having wasted threads because a lot of the hardware parameters are also powers of 2 and having hardware alignment boosts performance.
@@ -87,7 +91,7 @@ This our Kernel Launch code, it won't change much throughout the series. The mai
 % NAIVE SPEED HERE %
 
 ## Anatomy of a GPU
-Before we get into optimizing, we need to develop an understanding of the hardware that we are optimizing. In our case this is an NVIDIA Tesla T4 gpu. Starting from our largest supply of on-gpu memory we have DRAM. DRAM holds the global memory (GMEM) address space where most of our data is stored. This large size requires a tradeoff: GMEM accesses are slow, with relatively low throughput %%(300 GB/s) and high latency %%(300+ clock cycles).
+Before we start optimizing, we need to develop an understanding of the hardware that we are optimizing for. For this kernel, I'm targeting a NVIDIA Tesla T4 gpu (because its free). Starting from our largest supply of on-gpu memory we have DRAM. DRAM holds the global memory (GMEM) address space where most of our data is stored. This large size requires a tradeoff: GMEM accesses are slow, with relatively low throughput and high latency.
 
 <div align="center">
     <img src="diagrams/P4 DRAM labelled.svg" width="800">
@@ -468,21 +472,22 @@ __global__ void gemm_warptiled_kernel(const float* A, const float* B, float* C, 
 
 
 ## Vectorized
-Looking back at the PTX the compiler generated for the previous kernel, the load/store instructions that the compiler emitted are `ld.global.f32` and `st.shared.f32`. Although by default the compiler will emit these 32-bit load/stores, the gpu can also do 64-bit or 128-bit contiguous load/stores. For our 32-bit floats that means we can load/store either 2 or 4 elements with a single vectorized instruction. This is helpful because if issuing ld/st instructions is throttling our kernel, we can use vectorized instructions to alleviate that bottleneck.
+Looking back at the PTX the compiler generated for the previous kernel, the load/store instructions that the compiler emitted are `ld.global.f32` and `st.shared.f32`. Although by default the compiler will emit these 32-bit load/stores, the gpu can also do 64-bit or 128-bit vector load/stores in a single instruction. For our 32-bit floats that means we can load/store either 2 or 4 elements with a single vectorized instruction. This is helpful because if issuing ld/st instructions is throttling our kernel, we can use vectorized instructions to alleviate that bottleneck.
 
 <div align="center">
     <img src="diagrams/scalar vs vectorization.svg" width="600">
     <br>
 </div>
 
-If we want to make the most of the available GMEM bandwidth, we can use a coalesced memory access pattern. An access pattern is usually considered coalesced when adjacent threads from the same warp access adjacent contiguous data in a single instruction. This was necessary on extremely old gpus (GT80/GT200) because the hardware had a unit that would merge memory transactions from multiple threads only if the adjacent threads accessed adjacent data. On modern gpus, data is accessed in 128 byte cache lines*. To get the maximum bandwidth usage, all of the threads collectively have to access all of the values in all of the loaded cache line(s) in a single instruction. The thread ordering doesn't matter, as long as the entire cache line is used in a single instruction we get the max bandwidth. 
+If we want to make the most of the available GMEM bandwidth, we can use a coalesced memory access pattern. An access pattern is usually considered coalesced when adjacent threads from the same warp access adjacent contiguous data in a single instruction. This was necessary on extremely old gpus (GT80/GT200) because the hardware had a unit that would merge memory transactions from multiple threads only if the adjacent threads accessed adjacent data. On modern gpus, data is accessed at the warp granularity in 128 byte cache lines*. To get the maximum bandwidth usage, all of the threads collectively have to access all of the values in all of the loaded cache line(s) in a single instruction. The thread ordering doesn't matter, as long as the entire cache line is used in a single instruction we get the max bandwidth. 
 %% add note about hardware alignment on cache line boundary %%
 <div align="center">
     <img src="diagrams/coalescing.svg" width="600">
     <br>
 </div>
 
-If you went back to the previous kernels you would notice that the access pattern used from the start was already the standard coalesced pattern. This holds for even the naive kernel. However, if you are paying extremely close attention you may have realized that there is one operation where we do have threads trying to access contiguous values. Looking back at the store for the register blocked and warptiled kernels.
+
+Looking back at the previous kernels, nearly all of the memory accesses are already coalesced. The only non-coalesced accesses are the stores after the register blocked kernel.
 
 Register blocked store excerpt:
 ```cpp
@@ -497,7 +502,7 @@ for (int m = 0; m < FRAG_SIZE; m++) {
 }
 ```
 
-Looking at the address calculation, the first term, `(mt + in_tile_m + m) * N`, is strided so we dont have to worry about that. The contiguous second term, `(nt + in_tile_n + n)`, where n is the value that varies across loop iterations shows us that we are storing FRAG_SIZE=8 values contiguously per thread. This access pattern is exactly the pattern we want to avoid.
+Looking at the address calculation, the first term for the M dimension, `(mt + in_tile_m + m) * N`, is strided by `* N` so we dont have to worry about that. The second term, `(nt + in_tile_n + n)`, where n is the value that varies across loop iterations shows us that we are storing FRAG_SIZE=8 values contiguously per thread because this indexing is unstrided.
 
 Visually our access pattern looks like this: 
 <div align="center">
@@ -505,29 +510,30 @@ Visually our access pattern looks like this:
     <br>
 </div>
 
-Before we make changes, we should review the Nsight Compute profile of the previous kernel to get a baseline understanding. Looking at the Warp State Statistics section of the warptiled kernel's profile, we can see the distribution of what the warps are doing during a typical clock cycle.
+Before we continue making changes, we should review the Nsight Compute profile of the previous kernel to understand whats limiting our kernel. Looking at the Warp State Statistics section of the warptiled kernel's profile, we can see the distribution of what the warps are doing during a typical clock cycle.
 
 <div align="center">
     <img src="diagrams/warptiled_warp_state.png" width="600">
     <br>
 </div>
 
-For a kernel thats trying to be compute bound, the three good types of states are Stall Math Pipe Throttle (this increases as we get more compute bound), Selected (this means the sampled warp was executing an instruction), and Not Selected (the scheduler chose a different warp to run). Ideally, we minimize every other warp state. 
+For a kernel thats trying to be compute bound, the three good types of states are Stall Math Pipe Throttle (warp cannot execute because compute units are saturated), Selected (sampled warp was executing an instruction), and Not Selected (the scheduler chose a different warp to run). Ideally, we minimize every other warp state. 
 
-In this kernel, the main optimization will be reducing MIO throttle stalls. MIO throttle stalls occur when theres too many memory operations waiting to be dispatched in the hardware queue. The warp stalls until a slot frees up in the queue. Vectorization is perfect for this since it lets us load the same amount of data with fewer memory operations. So if we do 128 bit load/stores instead of the standard 32 bit ones, we would do 1/4 the amount of memory operations for the same amount of data transferred meaning that the queue will be full less often. 
+In this kernel, the focus will be reducing MIO throttle stalls. MIO throttle stalls occur when theres too many memory requests in the hardware queue, so the warp has to stall until a spot gets freed. Vectorization helps here because it increases the amount of data per request. For example, say if we switched from 32 bit scalar load instructions to 128 bit vector load instructions, it would only take a quarter of the amount of memory requests to load the same data. That reduction in memory request quantity is more than enough to keep the queue from bottlenecking the kernel.  
 
-There are two main approaches to implementing vectorization in cuda. We can either write in the vectorized ptx as inline assembly or we can use a packed dtype like float4 or int4 where 4 float32s/int32s are stored in one variable. We'll stick with float4s since we are using float32s. Inline ptx loads are more commonly used for lower precision data types.
+There are two ways to get vectorized memory acceses in cuda. We can either write in the vectorized ptx instruction in an inline asm block or we could reinterpret cast our data pointers to a packed vector dtype such as float4 or int4.
 
 Here's a sample line for loading from the vectorized kernel:
 ```cpp
 // __shared__ __align__(16) float tileA[TILE_M * TILE_K]; <-- tileA instantiation for context
 *(float4*)&tileA[idx] = maskA ? __ldcg((float4*)&A[(mt + idx / TILE_K) * K + (kt + idx % TILE_K)]) : zero; // (m index) * K + (k index)
 ```
-`*(float4*)&`† before the `tileA` and `A` arrays effectively reinterpret casts the float array into a float4 array while letting us keep standard float indexing*. `__align__(16)` enforces that the address of the base of the array is divisible by 16. We need this because our 128 bit (16 byte) vectorized load instructions require 16 byte hardware alignment. The `__ldcg()` load function is a function built into CUDA which when compiled turns into this PTX instruction (which can inlined directly too) `ld.global.cg.v4.f32`. The `.cg` part is the cache hint thats added by the instrinsic function which is short for "cache global"‡ meaning that we only cache in the L2 cache skipping storing in the L1 cache. I chose to do it this way for educational purposes. On this kernel, I expect no meaningful performance difference since we don't rely on L1 at all, but it's good practice for when you do need to keep caches clean on more demanding kernels. 
+`*(float4*)&` before the `tileA` and `A` arrays reinterpret casts the pointer of the value that would be located at idx in the array. For vectorized memory access instructions, the hardware requires that the address is aligned to the size of the access. So for the 128 bit vector accesses we would need 16 byte alignment, and to guarantee this we just ensure that we only ever access every 4th idx and that our SMEM is initialized with `__align__(16)`. `__ldcg()` is a load function included with CUDA which adds a `cg` (cache global) cache hint to our load instruction that tell the hardware to skip L1 and only use the L2 cache for this instruction's values. I added this just for show, this doesn't affect performance since this kernel's performance isn't reliant on L1. 
 
-<sup>† syntactically we are taking the pointer of the value at the given index, `&`, and then casting that pointer to float4, `(float4*)`, and finally we dereference `*` <br>
-\* float4 requires you to divide indices by 4 before accessing <br>
-‡ The global is referring to the scope of the L2. L2 is "global" to the gpu</sup>
+
+%% add a mention to padding the input tensors for keeping the kernel simple %% 
+
+
 
 For loading the access pattern is also coalesced because we maintain the rules of each warp utilizing the full loaded cache line in a single load instruction. The storing is still not fully coalesced after vectorization because before 8 contiguous elements were being loaded in separate instruction and now 2 contiguous 4-element vectors are being loaded in separate instructions. If we want to make our stores also coalesced, we can reassign the thread output tiles into split strided tiles so contiguous elements in a cache line are no longer loaded in separate instructions. 
 
@@ -537,12 +543,170 @@ This creates our final tiling strategy:
     <br>
 </div>
 
-Splitting it along the M dimension is optional here since iterating along it is already strided by N. The improvement comes from splitting the contiguous N dimension. 
+Splitting it along the M dimension is optional here since iterating along it is already strided by N. The improvement comes from splitting the N dimension because the N dimension was contiguous and needs to be strided. 
+
+This is what the new kernel looks like including all of the optimizations from this section:
+```c++
+constexpr int WARP_SIZE = 32; // constant for all nvidia gpus
+constexpr int BDIM = 256;
+constexpr int WARPS_PER_BLOCK = BDIM / WARP_SIZE;
+
+constexpr int TILE_M = 128; // block sizes along each dimension
+constexpr int TILE_N = TILE_M; 
+constexpr int TILE_K = 8; // small K and larger M and N boosts arithmetic intensity
+constexpr int FRAG_SIZE = 8;
+
+// for laying out warps within a block
+constexpr int WARP_PER_ROW = 2; // can be 2 or 4
+constexpr int WARP_TILE_N = TILE_N / WARP_PER_ROW;
+constexpr int WARP_TILE_M = TILE_M / (BDIM / WARP_SIZE / WARP_PER_ROW); // (NUM_WARPS / WARPS_PER_ROW) is warps per col
+
+constexpr int T_PER_WTILE_ROW = WARP_TILE_N / FRAG_SIZE;
+
+
+__global__ void gemm_vectorized_kernel(const float* A, const float* B, float* C, int M, int N, int K) {
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+    int warp_id = tid / WARP_SIZE;
+    int lane_id = tid % WARP_SIZE;
+    
+    // preprocess address calculations for SMEM -> reg and reg -> GMEM
+    int tile_offset_m = warp_id / WARP_PER_ROW * WARP_TILE_M + lane_id / T_PER_WTILE_ROW * FRAG_SIZE/2;
+    int tile_offset_n = warp_id % WARP_PER_ROW * WARP_TILE_N + lane_id % T_PER_WTILE_ROW * FRAG_SIZE/2;
+    
+    __shared__ __align__(16) float tileA[TILE_M * TILE_K]; // 128 x 8
+    __shared__ __align__(16) float tileB[TILE_K * TILE_N]; // 8 x 128
+
+    
+    float output[4][FRAG_SIZE/2][FRAG_SIZE/2] = {0}; // if we stride our output tiles well be able to coalesce our store
+
+    
+    int num_blks_n = (N + TILE_N - 1) / TILE_N;  
+    int mt = bid / num_blks_n * TILE_M; // m tile idx
+    int nt = bid % num_blks_n * TILE_N; // n tile idx
+    for (int kt = 0; kt < K; kt += TILE_K) {
+        // Load from GMEM to SMEM
+        int idx = tid * 4; // issue a vectorized load every 4th idx because 4 floats per vec
+        bool maskA = mt + idx / TILE_K < M && kt + idx % TILE_K < K;
+        bool maskB = kt + idx / TILE_N < K && nt + idx % TILE_N < N;
+        const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        *(float4*)&tileA[idx] = maskA ? __ldcg((float4*)&A[(mt + idx / TILE_K) * K + (kt + idx % TILE_K)]) : zero; // (m index) * K + (k index)
+        *(float4*)&tileB[idx] = maskB ? __ldcg((float4*)&B[(kt + idx / TILE_N) * N + (nt + idx % TILE_N)]) : zero;
+        __syncthreads();
+        
+        #pragma unroll
+        for (int k = 0; k < TILE_K; k++) {
+            float fragA[FRAG_SIZE];
+            float fragB[FRAG_SIZE];
+
+            // Load from SMEM to registers
+            #pragma unroll
+            for (int i = 0; i < FRAG_SIZE/2; i++) {
+                fragA[i] = tileA[(tile_offset_m + i) * TILE_K + (k)];
+                fragA[i + 4] = tileA[(tile_offset_m + i + WARP_TILE_M/2) * TILE_K + (k)];
+
+            }
+            *(float4*)&fragB[0] = *(float4*)&tileB[(k) * TILE_N + (tile_offset_n)];
+            *(float4*)&fragB[4] = *(float4*)&tileB[(k) * TILE_N + (tile_offset_n + WARP_TILE_N/2)];
+
+            // compute outer product (matmul for our two fragments)
+            #pragma unroll
+            for (int tile = 0; tile < 4; tile++) {
+                #pragma unroll
+                for (int m = 0; m < FRAG_SIZE/2; m++) {
+                    #pragma unroll
+                    for (int n = 0; n < FRAG_SIZE/2; n++) {
+                        output[tile][m][n] += fragA[tile / 2 * FRAG_SIZE/2 + m] * fragB[tile % 2 * FRAG_SIZE/2 + n];
+                    }
+                }
+            }
+        }
+        __syncthreads(); 
+
+    }
+    // write output to GMEM
+    #pragma unroll
+    for (int tile = 0; tile < 4; tile++) {    
+        #pragma unroll
+        for (int m = 0; m < FRAG_SIZE/2; m++) {
+            int tile_coord_m = tile_offset_m + tile / 2 * WARP_TILE_M/2 + m;
+            int tile_coord_n = tile_offset_n + tile % 2 * WARP_TILE_N/2;
+            __stwb((float4*)&C[(mt + tile_coord_m) * N + (nt + tile_coord_n)], *(float4*)&output[tile][m]); // __stwb is the same as the default store 
+        }
+    }
+}
+```
+Looking at the warp state statistics section in the ncu profile of this kernel we can see that MIO throttle stalls did improve. In the next section we'll focus on an optimization to eliminate the long scoreboard stalls.
+
+%% insert warp state statistics for after %% 
+
+%% maybe insert memory workload analysis request count %%
+
+%% insert benchmark results for vectorized %% 
+
 ## Double Buffered
 
+According to the warp state statistics, the main bottleneck of the previous section's kernel was long scoreboard stalls. When a warp executes a GMEM load, it can move on to the instructions after the load so long as they dont depend on the output of the load. However, if the warp gets to an instruction that depends on the output of the load it stalls until the data arrives. This is called a long scoreboard stall. 
 
+%% insert vectorized warp state again %%
 
-## Transposed
+To prevent long scoreboard stalls we would have to either remove the dependency or have enough work to complete such that the data arrives before the warp reaches the instructions dependent on it. 
 
+At a high level, the kernel currently executes like this:
 
-## Swizzled
+%% insert diagram with LDG n STS n COMPUTE n  %%
+
+The problem is that each iteration's SMEM store depends on the GMEM load immediately before it, so each store gets long scoreboard stalls at the beginning before any work is done. If we want there to be more work before the data is consumed, we could instead on each iteration load data for one iteration ahead. This way there is a whole iteration of computing between when the load is issued and when the first instruction dependent on it executes.  
+
+%% insert diagram with LDG n+1 COMPUTE n STS n + 1 %%
+
+The tradeoff for doing this is that it require two SMEM buffers to be live simultaneously, one for reading the current iterations values and one for writing the next iterations values. This is where the optimization's name "double buffering" comes from.
+
+%% insert implementation %% 
+
+Looking at the warp state statistics section we can see that long scoreboard stalls have largely been eliminated.
+
+%% insert double buffered warp state statistics %% 
+
+%% insert double buffered benchmark performance %% 
+
+## Transposed & Swizzled 
+
+The profile of the previous version's kernel says that our kernel's performance is suffering from too many many bank conflicts. SMEM is partitioned into 32 banks where each bank holds 32 bits of contiguous data and the next 32 bits is owned by the next bank and so on until it wraps back around and repeats from the start. A bank conflict occurs when theres a warp tries to access the 32 SMEM banks in a way that all 32 lanes dont map evenly to all 32 SMEM banks. When a warp tries to have two lanes access the same bank for different addresses the accesses get executed serially because one 32 bit value can be read per access to each bank. 
+
+%% insert memory banks visualization here %%
+
+The worst case scenario for accessing SMEM when its laid out like this would be if we were trying to access data in a columnar pattern because all 32 lanes of the warp are accessing one bank, so the single access gets serialized as separate accesses to the same bank. Looking at the tile loading from SMEM we can see that fragA is 4-way conflicted because one single access at the warp granularity maps to 4 different accesses. 
+
+To fix this, something would have to change something about the way that our data is distributed to banks such that when its accessed different lanes access different banks. SMEM address swizzling is an optimization that does exactly this. When we swizzle SMEM addresses we are modifying our 2D->1D address calculation function ((x, y) -> x * Y + y) to apply a reversible shuffle to the real address that the value is stored at. A typical SMEM swizzle for 32-bit values looks modifying the address calculation function to: (x, y) -> x * Y + y ^ x. This shuffles all of the columns of the function depending on according to a xo
+
+%%/w add section about why vectorization doesnt cause bank conflicts %% 
+
+%%
+SMEM Layout
+    Bank conflict mechanism - 32 banks × 4 B, serialization, broadcast
+    fragA is 4-way conflicted (64×/k-tile); cause is [TILE_M][TILE_K] stride 8
+    Transpose → loads clean, fragA vectorizes; conflict relocates to the 4 scalar stores
+    Swizzle → stores clean
+    Conflict counter chart (before / transposed / swizzled) + benchmark rows
+%%
+## Results
+%% TODO: 
+    - add store guards for C
+    - add align for all of the vectorized kernels
+    - explain why its padded and how you would implement it if it wasnt
+    - add static asserts
+    - 
+    - FIX: One concrete bug you may not know about: gemm_common.h:26-36 pads A/B for non-multiple-of-4 dims but leaves M/N/K at pre-pad values, so the kernel indexes padded memory with unpadded strides. Your GEMM benchmarks are all 4096, so it never fires — notably, the later project does test ragged shapes.
+    - investigate if swizzle is possible for accesses on row size 8, might be possible if (x, y) gets linearized first and then swizzled, might be able to get rid of transposed???
+    - fix vectorized comment
+    - address address calculation function?
+    - investigate higher clock speeds
+    - Change FRAG_SIZE to SUB_FRAG_SIZE = FRAG_SIZE / 2
+    - Explain why tile A isnt vectorized in vectorized writeup
+    - Talk about why the GMEM -> SMEM line is split in double buffered
+    - Fix factual error with A load not being coalesced in vectorized because its not coalesceable with this layout
+    - remove __ldcg or replace with inline ptx, remove written section about it as well
+    - delete __stwb
+    - maybe rewrite 128B cache line section to be about 32B sectors
+%%

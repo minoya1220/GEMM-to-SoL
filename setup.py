@@ -27,8 +27,10 @@ setup(
             ],
             extra_compile_args={
                 'nvcc': [
-                    '-O3',
+                    '-O2',
                     '-gencode=arch=compute_75,code=sm_75',  # T4 only
+                    '-lineinfo',
+                    '-Xptxas=-O2'
                 ]
             }
         )

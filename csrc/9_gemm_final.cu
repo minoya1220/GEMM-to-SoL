@@ -22,7 +22,7 @@ __device__ __forceinline__ int swizzleA(int row, int col){
     return row * TILE_M + (col ^ (row << 2));
 }
 
-__global__ void gemm_final_kernel(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int M, int N, int K) {
+__global__ void cutlass_gemm_final_kernel(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int M, int N, int K) {
     int bid = blockIdx.x;
     int tid = threadIdx.x;
     int warp_id = tid / WARP_SIZE;
@@ -31,10 +31,12 @@ __global__ void gemm_final_kernel(const float* __restrict__ A, const float* __re
     __shared__ __align__(16) float tileB[2][TILE_K * TILE_N]; // 8 x 128
     int read = 0;
     int write = 1;
-
     
-    float output[NUM_TILES * FRAG_SIZE/2 * FRAG_SIZE/2] = {0}; // if we stride our output tiles well be able to coalesce our store
-
+    
+    float output[NUM_TILES][FRAG_SIZE/2][FRAG_SIZE/2] = {0}; // if we stride our output tiles well be able to coalesce our store
+    
+    __align__(16) float fragA[2][2][FRAG_SIZE/2];
+    __align__(16) float fragB[2][2][FRAG_SIZE/2];
     
     // preprocess address calculations for SMEM -> reg and reg -> GMEM
     int tile_offset_m = warp_id / WARP_PER_ROW * WARP_TILE_M + lane_id / T_PER_WTILE_ROW * FRAG_SIZE/2;
@@ -56,9 +58,17 @@ __global__ void gemm_final_kernel(const float* __restrict__ A, const float* __re
     tileA[0][swizzleA((idx % TILE_K + 2), (idx / TILE_K))] = firstA.z;
     tileA[0][swizzleA((idx % TILE_K + 3), (idx / TILE_K))] = firstA.w;
 
+
     *(float4*)&tileB[0][idx] = maskB_0 ? __ldcg((float4*)&B[(idx / TILE_N) * N + (nt + idx % TILE_N)]) : zero;
 
+
     __syncthreads();
+    
+    *(float4*)&fragA[0][0][0] = *(float4*)&tileA[read][swizzleA(0, tile_offset_m)];
+    *(float4*)&fragA[0][1][0] = *(float4*)&tileA[read][swizzleA(0, tile_offset_m + WARP_TILE_M/2)];
+           
+    *(float4*)&fragB[0][0][0] = *(float4*)&tileB[read][(0) * TILE_N + (tile_offset_n)];
+    *(float4*)&fragB[0][1][0] = *(float4*)&tileB[read][(0) * TILE_N + (tile_offset_n + WARP_TILE_N/2)];
 
     for (int kt = 0; kt < K; kt += TILE_K) {
         // Begin the load for the next iteration if it exists
@@ -69,135 +79,67 @@ __global__ void gemm_final_kernel(const float* __restrict__ A, const float* __re
         float4 nextB = maskB ? __ldcg((float4*)&B[((kt + TILE_K) + idx / TILE_N) * N + (nt + idx % TILE_N)]) : zero;
         float4 nextA = maskA ? __ldcg((float4*)&A[(mt + idx / TILE_K) * K + ((kt + TILE_K) + idx % TILE_K)]) : zero; // (m index) * K + (k index)
 
-        
-        int reg_read = 0;
-        int reg_write = 1;
-        float currA_lo[FRAG_SIZE/2];
-        float currA_hi[FRAG_SIZE/2];
-        float currB_lo[FRAG_SIZE/2];
-        float currB_hi[FRAG_SIZE/2];
-
-
-        *(float4*)&currA_lo[0] = *(float4*)&tileA[read][swizzleA(0, tile_offset_m)];
-        *(float4*)&currA_hi[0] = *(float4*)&tileA[read][swizzleA(0, tile_offset_m + WARP_TILE_M/2)];
-           
-        *(float4*)&currB_lo[0] = *(float4*)&tileB[read][(0) * TILE_N + (tile_offset_n)];
-        *(float4*)&currB_hi[0] = *(float4*)&tileB[read][(0) * TILE_N + (tile_offset_n + WARP_TILE_N/2)];
 
         #pragma unroll 
         for (int k = 0; k < TILE_K; k++) {
-            int kv = k;
+            int kv = (k + 1) % TILE_K;
             asm("" : "+r"(kv)); 
 
-            float nextA_lo[FRAG_SIZE/2];
-            float nextA_hi[FRAG_SIZE/2];
-            float nextB_lo[FRAG_SIZE/2];
-            float nextB_hi[FRAG_SIZE/2];
-
+            // Store next iterations GMEM load into SMEM
+            if (k == 4){
+                *(float4*)&tileB[write][idx] = nextB;
+            }
+            if (k == 5) {
+                tileA[write][swizzleA((idx % TILE_K), (idx / TILE_K))]     = nextA.x; // transpose A tile while storing
+                tileA[write][swizzleA((idx % TILE_K + 1), (idx / TILE_K))] = nextA.y;
+                tileA[write][swizzleA((idx % TILE_K + 2), (idx / TILE_K))] = nextA.z;
+                tileA[write][swizzleA((idx % TILE_K + 3), (idx / TILE_K))] = nextA.w;
+            }
+            if (k == 7) {
+                // swap read and write buffers
+                __syncthreads(); // TODO: clear address registers, use padding, do ptr incrementing
+                read ^= 1; 
+                write ^= 1;
+            }
             // Load from SMEM to registers
-            bool r_mask = k < TILE_K - 1;
-            *(float4*)&nextA_lo[0] = r_mask ? *(float4*)&tileA[read][swizzleA(kv + 1, tile_offset_m)] : zero;
-            *(float4*)&nextA_hi[0] = r_mask ? *(float4*)&tileA[read][swizzleA(kv + 1, tile_offset_m + WARP_TILE_M/2)] : zero;
+            int reg_read = k % 2;
+            int reg_write = (k + 1) % 2;
+            int k_next = (k + 1) % TILE_K;
             
-            *(float4*)&nextB_lo[0] = r_mask ? *(float4*)&tileB[read][(k + 1) * TILE_N + (tile_offset_n)] : zero;
-            *(float4*)&nextB_hi[0] = r_mask ? *(float4*)&tileB[read][(k + 1) * TILE_N + (tile_offset_n + WARP_TILE_N/2)] : zero;
+            *(float4*)&fragA[reg_write][0][0] = *(float4*)&tileA[read][swizzleA(kv, tile_offset_m)];
+            *(float4*)&fragA[reg_write][1][0] = *(float4*)&tileA[read][swizzleA(kv, tile_offset_m + WARP_TILE_M/2)];
+    
+            *(float4*)&fragB[reg_write][0][0] = *(float4*)&tileB[read][k_next * TILE_N + (tile_offset_n)];
+            *(float4*)&fragB[reg_write][1][0] = *(float4*)&tileB[read][k_next * TILE_N + (tile_offset_n + WARP_TILE_N/2)];
             
             // compute outer product (matmul for our two fragments)
-            // #pragma unroll
-            // for (int tile = 0; tile < NUM_TILES; tile++) {
-            //     #pragma unroll
-            //     for (int m = 0; m < FRAG_SIZE/2; m++) {
-            //         #pragma unroll
-            //         for (int n = 0; n < FRAG_SIZE/2; n++) {
-            //             output[tile * NUM_TILES * FRAG_SIZE/2 + m * FRAG_SIZE/2 + n] += 
-            //                 fragA[reg_read * FRAG_SIZE + tile / 2 * FRAG_SIZE/2 + m] * fragB[reg_read * FRAG_SIZE + tile % 2 * FRAG_SIZE/2 + n];
-            //         }
-            //     }
-            // }
-            float4 tmp;
-
             #pragma unroll
-            for (int m = 0; m < FRAG_SIZE/2; m++) {
+            for (int tile = 0; tile < NUM_TILES; tile++) {
                 #pragma unroll
-                for (int n = 0; n < FRAG_SIZE/2; n++) {
-                    output[0 * NUM_TILES * FRAG_SIZE/2 + m * FRAG_SIZE/2 + n] += 
-                        currA_lo[m] * currB_lo[n];
+                for (int m = 0; m < FRAG_SIZE/2; m++) {
+                    #pragma unroll
+                    for (int n = 0; n < FRAG_SIZE/2; n++) {
+                        output[tile][m][n] += fragA[reg_read][tile/2][m] * fragB[reg_read][tile % 2][n];
+                        // maybe try to LDS 1 iter ahead
+                    }
                 }
             }
-            #pragma unroll
-            for (int m = 0; m < FRAG_SIZE/2; m++) {
-                #pragma unroll
-                for (int n = 0; n < FRAG_SIZE/2; n++) {
-                    output[1 * NUM_TILES * FRAG_SIZE/2 + m * FRAG_SIZE/2 + n] += 
-                        currA_hi[m] * currB_lo[n];
-                
-                }
-            }
-
-            tmp = *(float4*)&currB_lo;
-            *(float4*)&currB_lo[0] = *(float4*)&nextB_lo[0];
-            *(float4*)&nextB_lo[0] = tmp;
-
-            #pragma unroll
-            for (int m = 0; m < FRAG_SIZE/2; m++) {
-                #pragma unroll
-                for (int n = 0; n < FRAG_SIZE/2; n++) {
-                    output[2 * NUM_TILES * FRAG_SIZE/2 + m * FRAG_SIZE/2 + n] += 
-                        currA_hi[m] * currB_hi[n];
-                
-                }
-            }
-
-            tmp = *(float4*)&currA_hi;
-            *(float4*)&currA_hi[0] = *(float4*)&nextA_hi[0];
-            *(float4*)&nextA_hi[0] = tmp;
-
-            #pragma unroll
-            for (int m = 0; m < FRAG_SIZE/2; m++) {
-                #pragma unroll
-                for (int n = 0; n < FRAG_SIZE/2; n++) {
-                    output[3 * NUM_TILES * FRAG_SIZE/2 + m * FRAG_SIZE/2 + n] += 
-                        currA_lo[m] * currB_hi[n];
-                
-                }
-            }
-            
-            tmp = *(float4*)&currA_lo;
-            *(float4*)&currA_lo[0] = *(float4*)&nextA_lo[0];
-            *(float4*)&nextA_lo[0] = tmp;
-            
-            tmp = *(float4*)&currB_hi;
-            *(float4*)&currB_hi[0] = *(float4*)&nextB_hi[0];
-            *(float4*)&nextB_hi[0] = tmp;
             
         }
-
         
-
-
-        // Store next iterations GMEM load into SMEM
-        tileA[write][swizzleA((idx % TILE_K), (idx / TILE_K))]     = nextA.x; // transpose A tile while storing
-        tileA[write][swizzleA((idx % TILE_K + 1), (idx / TILE_K))] = nextA.y;
-        tileA[write][swizzleA((idx % TILE_K + 2), (idx / TILE_K))] = nextA.z;
-        tileA[write][swizzleA((idx % TILE_K + 3), (idx / TILE_K))] = nextA.w;
-
-        *(float4*)&tileB[write][idx] = nextB;
-
-        // swap read and write buffers
-        read ^= 1; 
-        write ^= 1;
-
-        __syncthreads(); // try moving this to the beginning of the loop
+        
+        
 
     }
     // write output to GMEM
+    // TODO: try non vector stores too
     #pragma unroll
     for (int tile = 0; tile < NUM_TILES; tile++) {    
         #pragma unroll
         for (int m = 0; m < FRAG_SIZE/2; m++) { // add boundary check
             int tile_coord_m = tile_offset_m + tile / 2 * WARP_TILE_M/2 + m;
             int tile_coord_n = tile_offset_n + tile % 2 * WARP_TILE_N/2;
-            __stwb((float4*)&C[(mt + tile_coord_m) * N + (nt + tile_coord_n)], *(float4*)&output[tile * NUM_TILES * FRAG_SIZE/2 + m * FRAG_SIZE/2]); 
+            __stwb((float4*)&C[(mt + tile_coord_m) * N + (nt + tile_coord_n)], *(float4*)&output[tile][m]); 
         }
     }
 }
@@ -208,7 +150,7 @@ torch::Tensor gemm_final(torch::Tensor A, torch::Tensor B) {
     dim3 block(BDIM);
     dim3 grid(((t.M + TILE_M - 1) / TILE_M) * ((t.N + TILE_N - 1) / TILE_N)); 
 
-    gemm_final_kernel<<<grid, block>>>(t.A, t.B, t.C, t.M, t.N, t.K);
+    cutlass_gemm_final_kernel<<<grid, block>>>(t.A, t.B, t.C, t.M, t.N, t.K);
     cudaDeviceSynchronize();
     
     return t.C_tensor;
