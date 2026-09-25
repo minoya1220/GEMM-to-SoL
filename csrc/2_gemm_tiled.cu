@@ -7,8 +7,7 @@ constexpr int BLOCK_SIZE = 256;
 __global__ void gemm_tiled_kernel(const float* A, const float* B, float* C, int M, int N, int K) {
     int tid = threadIdx.x;
     int bid = blockIdx.x;
-    int bdim = blockDim.x;
-    
+
     // allocate SMEM for input tiles
     __shared__ float tileA[TILE_SIZE * TILE_SIZE]; 
     __shared__ float tileB[TILE_SIZE * TILE_SIZE]; 
@@ -50,7 +49,7 @@ torch::Tensor gemm_tiled(torch::Tensor A, torch::Tensor B) {
     auto t = prep_tensors(A, B);
 
     dim3 block(BLOCK_SIZE); // = 256
-    dim3 grid((t.M + TILE_SIZE - 1) / TILE_SIZE * (t.N + TILE_SIZE - 1) / TILE_SIZE); 
+    dim3 grid(((t.M + TILE_SIZE - 1) / TILE_SIZE) * ((t.N + TILE_SIZE - 1) / TILE_SIZE));
 
     gemm_tiled_kernel<<<grid, block>>>(t.A, t.B, t.C, t.M, t.N, t.K);
     cudaDeviceSynchronize();

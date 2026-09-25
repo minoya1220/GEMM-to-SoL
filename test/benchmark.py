@@ -113,10 +113,12 @@ def bench_all(M, N, K, A, B, print_results: bool=True):
     benchmark(M, N, K, partial(gemm.gemm_naive, A, B), warmup=5, iters=10, print_results=print_results)
     benchmark(M, N, K, partial(gemm.gemm_tiled, A, B), warmup=5, iters=10, print_results=print_results)
     benchmark(M, N, K, partial(gemm.gemm_register_blocked, A, B), warmup=5, iters=10, print_results=print_results)
+    benchmark(M, N, K, partial(gemm.gemm_warptiled, A, B), warmup=5, iters=10, print_results=print_results)
     benchmark(M, N, K, partial(gemm.gemm_vectorized, A, B), warmup=5, iters=10, print_results=print_results)
     benchmark(M, N, K, partial(gemm.gemm_double_buffered, A, B), warmup=5, iters=10, print_results=print_results)
     benchmark(M, N, K, partial(gemm.gemm_transposed, A, B), warmup=5, iters=10, print_results=print_results)
     benchmark(M, N, K, partial(gemm.gemm_swizzled, A, B), warmup=5, iters=10, print_results=print_results)
+    benchmark(M, N, K, partial(gemm.gemm_final, A, B), warmup=5, iters=10, print_results=print_results)
     benchmark(M, N, K, partial(torch.matmul, A, B), warmup=5, iters=10, print_results=print_results)
     
 

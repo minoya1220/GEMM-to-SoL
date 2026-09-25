@@ -1,6 +1,8 @@
 # GEMM to SoL
 
-GEMM (General Matrix Multiply) to SoL (Speed of Light) are a collection of matrix multiplication kernels that build up optimizations upon each other to get as close as possible to the theoretical speed limit of matrix multiplication on gpus, the "speed of light." This project will be targeting SGEMM (fp32 GEMM) on a T4 gpu because it will help to build a strong foundation before moving on to modern features. The end result should be a kernel that is compute bound.
+GEMM (General Matrix Multiply) to SoL (Speed of Light) are a collection of matrix multiplication kernels that build up optimizations upon each other to get as close as possible to the theoretical speed limit of matrix multiplication on gpus, the "speed of light." This project will be targeting SGEMM (fp32 GEMM) on a T4 gpu. I chose SGEMM because it builds a strong foundation for understanding GEMMs and I chose the T4 because its free.
+
+%% insert linked ToC 
 
 ## Naive Implementation
 
@@ -27,6 +29,8 @@ Using input matrices A (shape: (M, K)) and B (shape: (K, N)) we can create an ou
 </div>
 
 To find the colored output element in the C matrix, we have to compute the dot product between the matching vectors from the A and B matrices. M, N, and K can be any size.
+
+%% To implement this in our kernel **Explain the code comment part here** include diagram %% 
 
 ### Naive kernel implementation:
 
@@ -86,12 +90,12 @@ torch::Tensor gemm_naive(torch::Tensor A, torch::Tensor B) {
 
 ```
 
-This our Kernel Launch code, it won't change much throughout the series. The main things to note are that we have chosen to have thread blocks that are 16x16 (256) threads large and that we are doing ceiling division so that we pad with extra threads in case our matrices have a dimension that is not divisible by block size. It is important that we keep our parameters either powers of 2 or multiples of high powers of 2 even if it means having wasted threads because a lot of the hardware parameters are also powers of 2 and having hardware alignment boosts performance.
+This our Kernel Launch code, it won't change much throughout the series. The main things to note are that we have chosen a flat 1D grid of 256 thread blocks, matching the flat `tid` the kernel indexes with, and that we are doing ceiling division so that we pad with extra threads in case our matrices have a dimension that is not divisible by block size. It is important that we keep our parameters either powers of 2 or multiples of high powers of 2 even if it means having wasted threads because a lot of the hardware parameters are also powers of 2 and having hardware alignment boosts performance.
 
 % NAIVE SPEED HERE %
 
 ## Anatomy of a GPU
-Before we start optimizing, we need to develop an understanding of the hardware that we are optimizing for. For this kernel, I'm targeting a NVIDIA Tesla T4 gpu (because its free). Starting from our largest supply of on-gpu memory we have DRAM. DRAM holds the global memory (GMEM) address space where most of our data is stored. This large size requires a tradeoff: GMEM accesses are slow, with relatively low throughput and high latency.
+Before we start optimizing, we need to develop an understanding of the hardware that we are optimizing for. Starting from our largest supply of on-gpu memory we have DRAM. DRAM holds the global memory (GMEM) address space where most of our data is stored. This large size requires a tradeoff: GMEM accesses are slow, with relatively low throughput and high latency.
 
 <div align="center">
     <img src="diagrams/P4 DRAM labelled.svg" width="800">
@@ -123,9 +127,9 @@ A diagram of a TU104 die used in a T4
 Source: [[2] NVIDIA Turing Architecture Whitepaper ](https://www.nvidia.com/content/dam/en-zz/Solutions/design-visualization/technologies/turing-architecture/NVIDIA-Turing-Architecture-Whitepaper.pdf)
 
 </sub>
-The L2 cache is the lowest level cache on the GPU memory hierarchy. It's responsible for speeding up redundant accesses to DRAM. Hitting the L2 cache takes us from DRAM's 300+ cycles latency<sup><a href="https://arxiv.org/pdf/1903.07486">[3]</a></sup> and 220 GiB/s bandwidth<sup><a href="https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/tesla-t4/t4-tensor-core-datasheet-951643.pdf">[4]</a></sup> to L2's 188 cycles latency<sup><a href="https://arxiv.org/pdf/1903.07486">[3]</a></sup> and 1.18 TiB/s bandwdith<sup><a href="https://arxiv.org/pdf/1903.07486">[3]</a></sup>. GPCs, TPCs, Raster Engines, PolyMorph Engines can all be ignored as they wont be relevant for our use case. 
+The L2 cache is the largest slowest cache on the gpu thats serves as a cache for redundant DRAM accesses across the the entire gpu. Hitting the L2 cache takes us from DRAM's 300+ cycles latency<sup><a href="https://arxiv.org/pdf/1903.07486">[3]</a></sup> and 220 GiB/s bandwidth<sup><a href="https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/tesla-t4/t4-tensor-core-datasheet-951643.pdf">[4]</a></sup> to L2's 188 cycles latency<sup><a href="https://arxiv.org/pdf/1903.07486">[3]</a></sup> and 1.18 TiB/s bandwdith<sup><a href="https://arxiv.org/pdf/1903.07486">[3]</a></sup>. GPCs, TPCs, Raster Engines, PolyMorph Engines can all be ignored as they wont be relevant for our use case. 
 
-&nbsp;
+&nbsp; %% insert memory hierarchy diagram here%% 
 
 Moving onto the SMs, SMs or Streaming Multiprocessors are the most basic self-contained execution units of a GPU. They can be thought of as the GPU analog for CPU cores. The SMs are responsible for executing entire thread blocks. The T4 has 40 of the TU104's 48 SMs enabled (8 are binned).
 
@@ -143,7 +147,7 @@ Source: [[2] NVIDIA Turing Architecture Whitepaper ](https://www.nvidia.com/cont
 
 </sub>
 
-Located at the bottom of the TU104 SM, the next level up on the memory hierarchy is Shared Memory (SMEM) and L1 cache. In the T4, SMEM and L1 share a 96 KiB allocation that can be split into 64 KiB & 32 KiB biased to either L1 or SMEM. The L1 cache is the highest level data cache in the GPU. If the result of GMEM read/write request is not in the L1 cache the request is passed to the L2 cache. It has a 32 cycle hit latency and 3,484 GiB/s aggregate bandwidth (87.1 GiB/s per SM). SMEM is a programmer managed memory local to each SM. SMEM is shared by within a block residing on an SM. Due to SMEM not having to deal with the overhead of caching, Its slightly faster with a latency of 19 cycles and an aggregate throughput of 3,662 GiB/s (91.6 GiB/s per SM).
+Located at the bottom of the TU104 SM, the next step up on the memory hierarchy is Shared Memory (SMEM) and L1 cache. In the T4, SMEM and L1 share a 96 KiB allocation that can be split into 64 KiB & 32 KiB biased to either L1 or SMEM. The L1 cache is the closest data cache to the compute units and its shared across an SM. If the result of GMEM read/write request is not in the L1 cache the request is passed to the L2 cache. It has a 32 cycle hit latency and 3,484 GiB/s aggregate bandwidth (87.1 GiB/s per SM). SMEM is a programmer managed memory that is partitioned by the blocks resident on the SM. Due to SMEM not having to deal with the overhead of caching, Its slightly faster with a latency of 19 cycles and an aggregate throughput of 3,662 GiB/s (91.6 GiB/s per SM). %% insert citation? %%
 
 Each SM is partitioned into 4 identical sections. At the top each section, we have the highest level of the memory hierarchy: the register file. The register file is responsible for holding each thread's "scratchpad." Before a thread runs an instruction, the operands must be in the thread's register allocation*. Below the register file we have the compute units: INT32 and FP32 house ALUs for their respective dtypes; Tensor cores do small matmuls in FP16, INT8, INT4, or INT1; LD/STs generate load/store requests; and SFUs handle special functions like exp, reciprocal, sqrt, trig functions, etc. Finally, at the top of a partition, we have the warp scheduler responsible for issuing instructions and managing concurrency within its partition.
 
@@ -168,7 +172,6 @@ In order to compute the final green output tile, the matmul between the green A1
 __global__ void gemm_tiled_kernel(const float* A, const float* B, float* C, int M, int N, int K) {
     int tid = threadIdx.x;
     int bid = blockIdx.x;
-    int bdim = blockDim.x;
     
     __shared__ float tileA[TILE_SIZE * TILE_SIZE]; // allocate SMEM
     __shared__ float tileB[TILE_SIZE * TILE_SIZE]; 
@@ -201,7 +204,9 @@ __global__ void gemm_tiled_kernel(const float* A, const float* B, float* C, int 
 
     }
     // write result from registers -> GMEM
-    C[(mt + in_tile_m) * N + (nt + in_tile_n)] = accum;
+    if ((mt + in_tile_m) < M && (nt + in_tile_n) < N) {
+        C[(mt + in_tile_m) * N + (nt + in_tile_n)] = accum;
+    }
 }
 ```
 Notice that we dont store the output tiles in SMEM. For usage in ML applications we would normally have to store the output into SMEM and then do another element-wise operation, usually an activation function. Since we aren't implementing that, the outputs are written straight from registers to GMEM. 
@@ -229,7 +234,6 @@ The code to produce this tiling strategy:
 ```cpp
 constexpr int WARP_SIZE = 32; // constant for all nvidia gpus
 constexpr int BDIM = 256;
-constexpr int WARPS_PER_BLOCK = BDIM / WARP_SIZE;
 
 constexpr int TILE_M = 128; // block sizes along each dimension
 constexpr int TILE_N = TILE_M; 
@@ -305,7 +309,9 @@ __global__ void gemm_register_blocked_kernel(const float* A, const float* B, flo
         for (int n = 0; n < FRAG_SIZE; n++) {
             int in_tile_m = tid / T_PER_ROW * FRAG_SIZE;
             int in_tile_n = tid % T_PER_ROW * FRAG_SIZE;
-            C[(mt + in_tile_m + m) * N + (nt + in_tile_n + n)] = output[m][n];
+            if (mt + in_tile_m + m < M && nt + in_tile_n + n < N) {
+                C[(mt + in_tile_m + m) * N + (nt + in_tile_n + n)] = output[m][n];
+            }
         }
     }
 }
@@ -380,7 +386,6 @@ The T_PER_WTILE_ROW and the WARPS_PER_ROW constants are needed for mapping threa
 ```cpp
 constexpr int WARP_SIZE = 32; // constant for all nvidia gpus
 constexpr int BDIM = 256;
-constexpr int WARPS_PER_BLOCK = BDIM / WARP_SIZE;
 
 constexpr int TILE_M = 128; // block sizes along each dimension
 constexpr int TILE_N = TILE_M; 
@@ -390,7 +395,7 @@ constexpr int FRAG_SIZE = 8;
 // for laying out warps within a block
 constexpr int WARP_PER_ROW = 2; // can be 2 or 4
 constexpr int WARP_TILE_N = TILE_N / WARP_PER_ROW; // 128 / 2 = 64
-constexpr int WARP_TILE_M = TILE_M / (BDIM / WARP_SIZE / WARP_PER_ROW); // (NUM_WARPS / WARPS_PER_ROW) is warps per col, // (256 / 32 / 2) = 4
+constexpr int WARP_TILE_M = TILE_M / (BDIM / WARP_SIZE / WARP_PER_ROW); // divisor (256 / 32 / 2) = 4 warps per col, so 128 / 4 = 32
 constexpr int T_PER_WTILE_ROW = WARP_TILE_N / FRAG_SIZE;
 
 
@@ -458,7 +463,9 @@ __global__ void gemm_warptiled_kernel(const float* A, const float* B, float* C, 
         for (int n = 0; n < FRAG_SIZE; n++) {
             int in_tile_m = warp_id / WARP_PER_ROW * WARP_TILE_M + lane_id / T_PER_WTILE_ROW * FRAG_SIZE;
             int in_tile_n = warp_id % WARP_PER_ROW * WARP_TILE_N + lane_id % T_PER_WTILE_ROW * FRAG_SIZE;
-            C[(mt + in_tile_m + m) * N + (nt + in_tile_n + n)] = output[m][n];
+            if (mt + in_tile_m + m < M && nt + in_tile_n + n < N) {
+                C[(mt + in_tile_m + m) * N + (nt + in_tile_n + n)] = output[m][n];
+            }
         }
     }
 }
@@ -479,7 +486,7 @@ Looking back at the PTX the compiler generated for the previous kernel, the load
     <br>
 </div>
 
-If we want to make the most of the available GMEM bandwidth, we can use a coalesced memory access pattern. An access pattern is usually considered coalesced when adjacent threads from the same warp access adjacent contiguous data in a single instruction. This was necessary on extremely old gpus (GT80/GT200) because the hardware had a unit that would merge memory transactions from multiple threads only if the adjacent threads accessed adjacent data. On modern gpus, data is accessed at the warp granularity in 128 byte cache lines*. To get the maximum bandwidth usage, all of the threads collectively have to access all of the values in all of the loaded cache line(s) in a single instruction. The thread ordering doesn't matter, as long as the entire cache line is used in a single instruction we get the max bandwidth. 
+If we want to make the most of the available GMEM bandwidth, we can use a coalesced memory access pattern. An access pattern is usually considered coalesced when adjacent threads from the same warp access adjacent contiguous data in a single instruction. This was necessary on extremely old gpus (G80/GT200) because the hardware had a unit that would merge memory transactions from multiple threads only if the adjacent threads accessed adjacent data. On modern gpus, data is accessed at the warp granularity in 128 byte cache lines*. To get the maximum bandwidth usage, all of the threads collectively have to access all of the values in all of the loaded cache line(s) in a single instruction. The thread ordering doesn't matter, as long as the entire cache line is used in a single instruction we get the max bandwidth. 
 %% add note about hardware alignment on cache line boundary %%
 <div align="center">
     <img src="diagrams/coalescing.svg" width="600">
@@ -549,7 +556,6 @@ This is what the new kernel looks like including all of the optimizations from t
 ```c++
 constexpr int WARP_SIZE = 32; // constant for all nvidia gpus
 constexpr int BDIM = 256;
-constexpr int WARPS_PER_BLOCK = BDIM / WARP_SIZE;
 
 constexpr int TILE_M = 128; // block sizes along each dimension
 constexpr int TILE_N = TILE_M; 
@@ -562,9 +568,10 @@ constexpr int WARP_TILE_N = TILE_N / WARP_PER_ROW;
 constexpr int WARP_TILE_M = TILE_M / (BDIM / WARP_SIZE / WARP_PER_ROW); // (NUM_WARPS / WARPS_PER_ROW) is warps per col
 
 constexpr int T_PER_WTILE_ROW = WARP_TILE_N / FRAG_SIZE;
+constexpr int NUM_TILES = 4;
 
 
-__global__ void gemm_vectorized_kernel(const float* A, const float* B, float* C, int M, int N, int K) {
+__global__ void gemm_vectorized_kernel(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int M, int N, int K) {
     int bid = blockIdx.x;
     int tid = threadIdx.x;
     int warp_id = tid / WARP_SIZE;
@@ -578,7 +585,7 @@ __global__ void gemm_vectorized_kernel(const float* A, const float* B, float* C,
     __shared__ __align__(16) float tileB[TILE_K * TILE_N]; // 8 x 128
 
     
-    float output[4][FRAG_SIZE/2][FRAG_SIZE/2] = {0}; // if we stride our output tiles well be able to coalesce our store
+    float __align__(16) output[NUM_TILES][FRAG_SIZE/2][FRAG_SIZE/2] = {0}; // if we stride our output tiles well be able to coalesce our store
 
     
     int num_blks_n = (N + TILE_N - 1) / TILE_N;  
@@ -596,22 +603,22 @@ __global__ void gemm_vectorized_kernel(const float* A, const float* B, float* C,
         
         #pragma unroll
         for (int k = 0; k < TILE_K; k++) {
-            float fragA[FRAG_SIZE];
-            float fragB[FRAG_SIZE];
+            __align__(16) float fragA[FRAG_SIZE];
+            __align__(16) float fragB[FRAG_SIZE];
 
             // Load from SMEM to registers
             #pragma unroll
             for (int i = 0; i < FRAG_SIZE/2; i++) {
                 fragA[i] = tileA[(tile_offset_m + i) * TILE_K + (k)];
-                fragA[i + 4] = tileA[(tile_offset_m + i + WARP_TILE_M/2) * TILE_K + (k)];
+                fragA[i + FRAG_SIZE/2] = tileA[(tile_offset_m + i + WARP_TILE_M/2) * TILE_K + (k)];
 
             }
             *(float4*)&fragB[0] = *(float4*)&tileB[(k) * TILE_N + (tile_offset_n)];
-            *(float4*)&fragB[4] = *(float4*)&tileB[(k) * TILE_N + (tile_offset_n + WARP_TILE_N/2)];
+            *(float4*)&fragB[FRAG_SIZE/2] = *(float4*)&tileB[(k) * TILE_N + (tile_offset_n + WARP_TILE_N/2)];
 
             // compute outer product (matmul for our two fragments)
             #pragma unroll
-            for (int tile = 0; tile < 4; tile++) {
+            for (int tile = 0; tile < NUM_TILES; tile++) {
                 #pragma unroll
                 for (int m = 0; m < FRAG_SIZE/2; m++) {
                     #pragma unroll
@@ -626,12 +633,14 @@ __global__ void gemm_vectorized_kernel(const float* A, const float* B, float* C,
     }
     // write output to GMEM
     #pragma unroll
-    for (int tile = 0; tile < 4; tile++) {    
+    for (int tile = 0; tile < NUM_TILES; tile++) {    
         #pragma unroll
         for (int m = 0; m < FRAG_SIZE/2; m++) {
             int tile_coord_m = tile_offset_m + tile / 2 * WARP_TILE_M/2 + m;
             int tile_coord_n = tile_offset_n + tile % 2 * WARP_TILE_N/2;
-            __stwb((float4*)&C[(mt + tile_coord_m) * N + (nt + tile_coord_n)], *(float4*)&output[tile][m]); // __stwb is the same as the default store 
+            if (mt + tile_coord_m < M && nt + tile_coord_n < N) {
+                __stwb((float4*)&C[(mt + tile_coord_m) * N + (nt + tile_coord_n)], *(float4*)&output[tile][m]); // __stwb is the same as the default store 
+            }
         }
     }
 }
@@ -672,11 +681,17 @@ Looking at the warp state statistics section we can see that long scoreboard sta
 
 ## Transposed & Swizzled 
 
-The profile of the previous version's kernel says that our kernel's performance is suffering from too many many bank conflicts. SMEM is partitioned into 32 banks where each bank holds 32 bits of contiguous data and the next 32 bits is owned by the next bank and so on until it wraps back around and repeats from the start. A bank conflict occurs when theres a warp tries to access the 32 SMEM banks in a way that all 32 lanes dont map evenly to all 32 SMEM banks. When a warp tries to have two lanes access the same bank for different addresses the accesses get executed serially because one 32 bit value can be read per access to each bank. 
+For the double buffered kernel, nsight compute is flagging that our kernel is getting slowed down by a 4-way bank conflict. A bank conflict occurs when a memory access two different 32 bit words from the same bank in a single memory access. SMEM is partitioned into 32 banks where each bank is 4 bytes wide. Every consecutive 4 byte word maps into a consecutive bank until bank 31 where it wraps around to bank 0. When a conflict occurs the access gets split into multiple wavefronts issued one after the other. A wavefront is one pass through SMEM during which each bank can serve one of its 32 bit words. 
 
 %% insert memory banks visualization here %%
 
-The worst case scenario for accessing SMEM when its laid out like this would be if we were trying to access data in a columnar pattern because all 32 lanes of the warp are accessing one bank, so the single access gets serialized as separate accesses to the same bank. Looking at the tile loading from SMEM we can see that fragA is 4-way conflicted because one single access at the warp granularity maps to 4 different accesses. 
+A conflict-free memory access for float32s only issues one wavefront. However, for an n-way bank conflict (n unique words being accessed from a single bank in a single request) the memory access has to be issued as n wavefronts.
+
+%% insert no-conflict visual & 4-way bank conflict %% 
+
+The worst case scenario for accessing SMEM in this layout would be if a warp issued a memory access where all the lanes access along a column in an array where the row stride is 32 or a multiple of 32. In this scenario, a 32-way bank conflict is created and the memory access issues 32 wavefronts with each wavefront only accessing 1 element. 
+
+If we map out our access pattern for the A tile we can see exactly why 
 
 To fix this, something would have to change something about the way that our data is distributed to banks such that when its accessed different lanes access different banks. SMEM address swizzling is an optimization that does exactly this. When we swizzle SMEM addresses we are modifying our 2D->1D address calculation function ((x, y) -> x * Y + y) to apply a reversible shuffle to the real address that the value is stored at. A typical SMEM swizzle for 32-bit values looks modifying the address calculation function to: (x, y) -> x * Y + y ^ x. This shuffles all of the columns of the function depending on according to a xo
 
@@ -692,12 +707,8 @@ SMEM Layout
 %%
 ## Results
 %% TODO: 
-    - add store guards for C
     - add align for all of the vectorized kernels
     - explain why its padded and how you would implement it if it wasnt
-    - add static asserts
-    - 
-    - FIX: One concrete bug you may not know about: gemm_common.h:26-36 pads A/B for non-multiple-of-4 dims but leaves M/N/K at pre-pad values, so the kernel indexes padded memory with unpadded strides. Your GEMM benchmarks are all 4096, so it never fires — notably, the later project does test ragged shapes.
     - investigate if swizzle is possible for accesses on row size 8, might be possible if (x, y) gets linearized first and then swizzled, might be able to get rid of transposed???
     - fix vectorized comment
     - address address calculation function?

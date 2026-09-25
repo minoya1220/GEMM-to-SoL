@@ -3,7 +3,6 @@
 
 constexpr int WARP_SIZE = 32; // constant for all nvidia gpus
 constexpr int BDIM = 256;
-constexpr int WARPS_PER_BLOCK = BDIM / WARP_SIZE;
 
 constexpr int TILE_M = 128; // block sizes along each dimension
 constexpr int TILE_N = TILE_M; 
@@ -81,7 +80,9 @@ __global__ void gemm_warptiled_kernel(const float* A, const float* B, float* C, 
         for (int n = 0; n < FRAG_SIZE; n++) {
             int in_tile_m = warp_id / WARP_PER_ROW * WARP_TILE_M + lane_id / T_PER_WTILE_ROW * FRAG_SIZE;
             int in_tile_n = warp_id % WARP_PER_ROW * WARP_TILE_N + lane_id % T_PER_WTILE_ROW * FRAG_SIZE;
-            C[(mt + in_tile_m + m) * N + (nt + in_tile_n + n)] = output[m][n];
+            if (mt + in_tile_m + m < M && nt + in_tile_n + n < N) {
+                C[(mt + in_tile_m + m) * N + (nt + in_tile_n + n)] = output[m][n];
+            }
         }
     }
 }

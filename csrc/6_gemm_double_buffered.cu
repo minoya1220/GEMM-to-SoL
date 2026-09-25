@@ -15,10 +15,11 @@ constexpr int WARP_TILE_N = TILE_N / WARP_PER_ROW;
 constexpr int WARP_TILE_M = TILE_M / (BDIM / WARP_SIZE / WARP_PER_ROW); // (NUM_WARPS / WARPS_PER_ROW) is warps per col
 
 constexpr int T_PER_WTILE_ROW = WARP_TILE_N / FRAG_SIZE;
+constexpr int NUM_TILES = 4;
 
 
 
-__global__ void gemm_double_buffered_kernel(const float* A, const float* B, float* C, int M, int N, int K) {
+__global__ void gemm_double_buffered_kernel(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int M, int N, int K) {
     int bid = blockIdx.x;
     int tid = threadIdx.x;
     int warp_id = tid / WARP_SIZE;
@@ -29,7 +30,7 @@ __global__ void gemm_double_buffered_kernel(const float* A, const float* B, floa
     int write = 1;
 
     
-    float output[4][FRAG_SIZE/2][FRAG_SIZE/2] = {0}; // if we stride our output tiles well be able to coalesce our store
+    float __align__(16) output[NUM_TILES][FRAG_SIZE/2][FRAG_SIZE/2] = {0}; // if we stride our output tiles well be able to coalesce our store
 
     
     // preprocess address calculations for SMEM -> reg and reg -> GMEM
@@ -52,8 +53,8 @@ __global__ void gemm_double_buffered_kernel(const float* A, const float* B, floa
 
     for (int kt = 0; kt < K; kt += TILE_K) {
         // Begin the load for the next iteration if it exists
-        bool maskA = mt + idx / TILE_K < M && (kt + TILE_K) + idx % TILE_K < K && (kt + TILE_K) < K;
-        bool maskB = (kt + TILE_K) + idx / TILE_N < K && nt + idx % TILE_N < N && (kt + TILE_K) < K;
+        bool maskA = mt + idx / TILE_K < M && (kt + TILE_K) + idx % TILE_K < K;
+        bool maskB = (kt + TILE_K) + idx / TILE_N < K && nt + idx % TILE_N < N;
 
         // start GMEM load for next iterations 
         float4 nextA = maskA ? __ldcg((float4*)&A[(mt + idx / TILE_K) * K + ((kt + TILE_K) + idx % TILE_K)]) : zero; // (m index) * K + (k index)
@@ -62,22 +63,22 @@ __global__ void gemm_double_buffered_kernel(const float* A, const float* B, floa
         
         #pragma unroll
         for (int k = 0; k < TILE_K; k++) {
-            float fragA[FRAG_SIZE];
-            float fragB[FRAG_SIZE];
+            __align__(16) float fragA[FRAG_SIZE];
+            __align__(16) float fragB[FRAG_SIZE];
 
             // Load from SMEM to registers
             #pragma unroll
             for (int i = 0; i < FRAG_SIZE/2; i++) {
                 fragA[i] = tileA[read][(tile_offset_m + i) * TILE_K + (k)];
-                fragA[i + 4] = tileA[read][(tile_offset_m + i + WARP_TILE_M/2) * TILE_K + (k)];
+                fragA[i + FRAG_SIZE/2] = tileA[read][(tile_offset_m + i + WARP_TILE_M/2) * TILE_K + (k)];
 
             }
             *(float4*)&fragB[0] = *(float4*)&tileB[read][(k) * TILE_N + (tile_offset_n)];
-            *(float4*)&fragB[4] = *(float4*)&tileB[read][(k) * TILE_N + (tile_offset_n + WARP_TILE_N/2)];
+            *(float4*)&fragB[FRAG_SIZE/2] = *(float4*)&tileB[read][(k) * TILE_N + (tile_offset_n + WARP_TILE_N/2)];
 
             // compute outer product (matmul for our two fragments)
             #pragma unroll
-            for (int tile = 0; tile < 4; tile++) {
+            for (int tile = 0; tile < NUM_TILES; tile++) {
                 #pragma unroll
                 for (int m = 0; m < FRAG_SIZE/2; m++) {
                     #pragma unroll
@@ -101,12 +102,14 @@ __global__ void gemm_double_buffered_kernel(const float* A, const float* B, floa
     }
     // write output to GMEM
     #pragma unroll
-    for (int tile = 0; tile < 4; tile++) {    
+    for (int tile = 0; tile < NUM_TILES; tile++) {
         #pragma unroll
         for (int m = 0; m < FRAG_SIZE/2; m++) {
             int tile_coord_m = tile_offset_m + tile / 2 * WARP_TILE_M/2 + m;
             int tile_coord_n = tile_offset_n + tile % 2 * WARP_TILE_N/2;
-            __stwb((float4*)&C[(mt + tile_coord_m) * N + (nt + tile_coord_n)], *(float4*)&output[tile][m]); 
+            if (mt + tile_coord_m < M && nt + tile_coord_n < N) {
+                __stwb((float4*)&C[(mt + tile_coord_m) * N + (nt + tile_coord_n)], *(float4*)&output[tile][m]);
+            }
         }
     }
 }

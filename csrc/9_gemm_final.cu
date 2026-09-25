@@ -27,13 +27,13 @@ __global__ void cutlass_gemm_final_kernel(const float* __restrict__ A, const flo
     int tid = threadIdx.x;
     int warp_id = tid / WARP_SIZE;
     int lane_id = tid % WARP_SIZE;
-    __shared__ __align__(16) float tileA[2][TILE_K * TILE_M]; // 128 x 8
+    __shared__ __align__(16) float tileA[2][TILE_K * TILE_M]; // 8 x 128, transposed on store
     __shared__ __align__(16) float tileB[2][TILE_K * TILE_N]; // 8 x 128
     int read = 0;
     int write = 1;
     
     
-    float output[NUM_TILES][FRAG_SIZE/2][FRAG_SIZE/2] = {0}; // if we stride our output tiles well be able to coalesce our store
+    float __align__(16) output[NUM_TILES][FRAG_SIZE/2][FRAG_SIZE/2] = {0}; // if we stride our output tiles well be able to coalesce our store
     
     __align__(16) float fragA[2][2][FRAG_SIZE/2];
     __align__(16) float fragB[2][2][FRAG_SIZE/2];
@@ -72,8 +72,8 @@ __global__ void cutlass_gemm_final_kernel(const float* __restrict__ A, const flo
 
     for (int kt = 0; kt < K; kt += TILE_K) {
         // Begin the load for the next iteration if it exists
-        bool maskB = (kt + TILE_K) + idx / TILE_N < K && nt + idx % TILE_N < N && (kt + TILE_K) < K;
-        bool maskA = mt + idx / TILE_K < M && (kt + TILE_K) + idx % TILE_K < K && (kt + TILE_K) < K;
+        bool maskB = (kt + TILE_K) + idx / TILE_N < K && nt + idx % TILE_N < N;
+        bool maskA = mt + idx / TILE_K < M && (kt + TILE_K) + idx % TILE_K < K;
 
         // start GMEM load for next iterations
         float4 nextB = maskB ? __ldcg((float4*)&B[((kt + TILE_K) + idx / TILE_N) * N + (nt + idx % TILE_N)]) : zero;
@@ -136,10 +136,12 @@ __global__ void cutlass_gemm_final_kernel(const float* __restrict__ A, const flo
     #pragma unroll
     for (int tile = 0; tile < NUM_TILES; tile++) {    
         #pragma unroll
-        for (int m = 0; m < FRAG_SIZE/2; m++) { // add boundary check
+        for (int m = 0; m < FRAG_SIZE/2; m++) {
             int tile_coord_m = tile_offset_m + tile / 2 * WARP_TILE_M/2 + m;
             int tile_coord_n = tile_offset_n + tile % 2 * WARP_TILE_N/2;
-            __stwb((float4*)&C[(mt + tile_coord_m) * N + (nt + tile_coord_n)], *(float4*)&output[tile][m]); 
+            if (mt + tile_coord_m < M && nt + tile_coord_n < N) {
+                __stwb((float4*)&C[(mt + tile_coord_m) * N + (nt + tile_coord_n)], *(float4*)&output[tile][m]);
+            }
         }
     }
 }

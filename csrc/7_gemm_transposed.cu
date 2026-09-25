@@ -15,30 +15,31 @@ constexpr int WARP_TILE_N = TILE_N / WARP_PER_ROW;
 constexpr int WARP_TILE_M = TILE_M / (BDIM / WARP_SIZE / WARP_PER_ROW); // (NUM_WARPS / WARPS_PER_ROW) is warps per col
 
 constexpr int T_PER_WTILE_ROW = WARP_TILE_N / FRAG_SIZE;
+constexpr int NUM_TILES = 4;
 
 
 
-__global__ void gemm_transposed_kernel(const float* A, const float* B, float* C, int M, int N, int K) {
+__global__ void gemm_transposed_kernel(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int M, int N, int K) {
     int bid = blockIdx.x;
     int tid = threadIdx.x;
     int warp_id = tid / WARP_SIZE;
     int lane_id = tid % WARP_SIZE;
-    __shared__ __align__(16) float tileA[2][TILE_M * TILE_K]; // 128 x 8
+    __shared__ __align__(16) float tileA[2][TILE_K * TILE_M]; // 8 x 128, transposed on store
     __shared__ __align__(16) float tileB[2][TILE_K * TILE_N]; // 8 x 128
     int read = 0;
     int write = 1;
 
     
-    float output[4][FRAG_SIZE/2][FRAG_SIZE/2] = {0}; 
+    float __align__(16) output[NUM_TILES][FRAG_SIZE/2][FRAG_SIZE/2] = {0}; // if we stride our output tiles well be able to coalesce our store
 
     
     // preprocess address calculations for SMEM -> reg and reg -> GMEM
     int tile_offset_m = warp_id / WARP_PER_ROW * WARP_TILE_M + lane_id / T_PER_WTILE_ROW * FRAG_SIZE/2;
     int tile_offset_n = warp_id % WARP_PER_ROW * WARP_TILE_N + lane_id % T_PER_WTILE_ROW * FRAG_SIZE/2;
     
-    int n_blks = (N + TILE_N - 1) / TILE_N;  
-    int mt = bid / n_blks * TILE_M; // m tile idx
-    int nt = bid % n_blks * TILE_N; // n tile idx
+    int num_blks_n = (N + TILE_N - 1) / TILE_N;
+    int mt = bid / num_blks_n * TILE_M; // m tile idx
+    int nt = bid % num_blks_n * TILE_N; // n tile idx
     int idx = tid * 4;
 
     // Load first iteration tiles from GMEM to SMEM
@@ -56,8 +57,8 @@ __global__ void gemm_transposed_kernel(const float* A, const float* B, float* C,
 
     for (int kt = 0; kt < K; kt += TILE_K) {
         // Begin the load for the next iteration if it exists
-        bool maskA = mt + idx / TILE_K < M && (kt + TILE_K) + idx % TILE_K < K && (kt + TILE_K) < K;
-        bool maskB = (kt + TILE_K) + idx / TILE_N < K && nt + idx % TILE_N < N && (kt + TILE_K) < K;
+        bool maskA = mt + idx / TILE_K < M && (kt + TILE_K) + idx % TILE_K < K;
+        bool maskB = (kt + TILE_K) + idx / TILE_N < K && nt + idx % TILE_N < N;
 
         // start GMEM load for next iterations 
         float4 nextA = maskA ? __ldcg((float4*)&A[(mt + idx / TILE_K) * K + ((kt + TILE_K) + idx % TILE_K)]) : zero; // (m index) * K + (k index)
@@ -66,19 +67,19 @@ __global__ void gemm_transposed_kernel(const float* A, const float* B, float* C,
         
         #pragma unroll
         for (int k = 0; k < TILE_K; k++) {
-            float fragA[FRAG_SIZE];
-            float fragB[FRAG_SIZE];
+            __align__(16) float fragA[FRAG_SIZE];
+            __align__(16) float fragB[FRAG_SIZE];
 
             // Load from SMEM to registers
             *(float4*)&fragA[0] = *(float4*)&tileA[read][(k) * TILE_M + (tile_offset_m)];
-            *(float4*)&fragA[4] = *(float4*)&tileA[read][(k) * TILE_M + (tile_offset_m + WARP_TILE_M/2)];
-           
+            *(float4*)&fragA[FRAG_SIZE/2] = *(float4*)&tileA[read][(k) * TILE_M + (tile_offset_m + WARP_TILE_M/2)];
+
             *(float4*)&fragB[0] = *(float4*)&tileB[read][(k) * TILE_N + (tile_offset_n)];
-            *(float4*)&fragB[4] = *(float4*)&tileB[read][(k) * TILE_N + (tile_offset_n + WARP_TILE_N/2)];
+            *(float4*)&fragB[FRAG_SIZE/2] = *(float4*)&tileB[read][(k) * TILE_N + (tile_offset_n + WARP_TILE_N/2)];
 
             // compute outer product (matmul for our two fragments)
             #pragma unroll
-            for (int tile = 0; tile < 4; tile++) {
+            for (int tile = 0; tile < NUM_TILES; tile++) {
                 #pragma unroll
                 for (int m = 0; m < FRAG_SIZE/2; m++) {
                     #pragma unroll
@@ -108,12 +109,14 @@ __global__ void gemm_transposed_kernel(const float* A, const float* B, float* C,
     }
     // write output to GMEM
     #pragma unroll
-    for (int tile = 0; tile < 4; tile++) {    
+    for (int tile = 0; tile < NUM_TILES; tile++) {
         #pragma unroll
         for (int m = 0; m < FRAG_SIZE/2; m++) {
             int tile_coord_m = tile_offset_m + tile / 2 * WARP_TILE_M/2 + m;
             int tile_coord_n = tile_offset_n + tile % 2 * WARP_TILE_N/2;
-            __stwb((float4*)&C[(mt + tile_coord_m) * N + (nt + tile_coord_n)], *(float4*)&output[tile][m]); 
+            if (mt + tile_coord_m < M && nt + tile_coord_n < N) {
+                __stwb((float4*)&C[(mt + tile_coord_m) * N + (nt + tile_coord_n)], *(float4*)&output[tile][m]);
+            }
         }
     }
 }

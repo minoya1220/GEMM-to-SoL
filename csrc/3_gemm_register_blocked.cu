@@ -3,7 +3,6 @@
 
 constexpr int WARP_SIZE = 32; // constant for all nvidia gpus
 constexpr int BDIM = 256;
-constexpr int WARPS_PER_BLOCK = BDIM / WARP_SIZE;
 
 constexpr int TILE_M = 128; // block sizes along each dimension
 constexpr int TILE_N = TILE_M; 
@@ -73,7 +72,9 @@ __global__ void gemm_register_blocked_kernel(const float* A, const float* B, flo
         for (int n = 0; n < FRAG_SIZE; n++) {
             int in_tile_m = tid / T_PER_ROW * FRAG_SIZE;
             int in_tile_n = tid % T_PER_ROW * FRAG_SIZE;
-            C[(mt + in_tile_m + m) * N + (nt + in_tile_n + n)] = output[m][n];
+            if (mt + in_tile_m + m < M && nt + in_tile_n + n < N) {
+                C[(mt + in_tile_m + m) * N + (nt + in_tile_n + n)] = output[m][n];
+            }
         }
     }
 }
