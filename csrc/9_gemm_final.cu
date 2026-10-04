@@ -5,7 +5,7 @@ constexpr int WARP_SIZE = 32; // constant for all nvidia gpus
 constexpr int BDIM = 256; 
 
 constexpr int TILE_M = 128; // block sizes along each dimension
-constexpr int TILE_N = TILE_M;  
+constexpr int TILE_N = 128;  
 constexpr int TILE_K = 8; // small K and larger M and N boosts arithmetic intensity
 constexpr int FRAG_SIZE = 8;
 constexpr int SUB_FRAG_SIZE = FRAG_SIZE / 2;
@@ -20,7 +20,7 @@ constexpr int NUM_TILES = 4;
 
 
 __device__ __forceinline__ int swizzleA(int row, int col){
-    return row * TILE_M + (col ^ (row << 2));
+    return row * (TILE_M + 4) + (col);// ^ (row << 2));
 }
 
 __global__ void cutlass_gemm_final_kernel(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int M, int N, int K) {
@@ -28,7 +28,7 @@ __global__ void cutlass_gemm_final_kernel(const float* __restrict__ A, const flo
     int tid = threadIdx.x;
     int warp_id = tid / WARP_SIZE;
     int lane_id = tid % WARP_SIZE;
-    __shared__ __align__(16) float tileA[2][TILE_K * TILE_M]; // 8 x 128, transposed on store
+    __shared__ __align__(16) float tileA[2][TILE_K * (TILE_M + 4)]; // 8 x 132, transposed on store
     __shared__ __align__(16) float tileB[2][TILE_K * TILE_N]; // 8 x 128
     int read = 0;
     int write = 1;
@@ -53,14 +53,14 @@ __global__ void cutlass_gemm_final_kernel(const float* __restrict__ A, const flo
     bool maskA_0 = mt + idx / TILE_K < M && idx % TILE_K < K;
     const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     
-    float4 firstA = maskA_0 ? __ldcg((float4*)&A[(mt + idx / TILE_K) * K + (idx % TILE_K)]) : zero; // (m index) * K + (k index)
+    float4 firstA = maskA_0 ? __ldg((float4*)&A[(mt + idx / TILE_K) * K + (idx % TILE_K)]) : zero; // (m index) * K + (k index)
     tileA[0][swizzleA((idx % TILE_K),     (idx / TILE_K))] = firstA.x; // transpose A while storing
     tileA[0][swizzleA((idx % TILE_K + 1), (idx / TILE_K))] = firstA.y;
     tileA[0][swizzleA((idx % TILE_K + 2), (idx / TILE_K))] = firstA.z;
     tileA[0][swizzleA((idx % TILE_K + 3), (idx / TILE_K))] = firstA.w;
 
 
-    *(float4*)&tileB[0][idx] = maskB_0 ? __ldcg((float4*)&B[(idx / TILE_N) * N + (nt + idx % TILE_N)]) : zero;
+    *(float4*)&tileB[0][idx] = maskB_0 ? __ldg((float4*)&B[(idx / TILE_N) * N + (nt + idx % TILE_N)]) : zero;
 
 
     __syncthreads();
@@ -77,14 +77,14 @@ __global__ void cutlass_gemm_final_kernel(const float* __restrict__ A, const flo
         bool maskA = mt + idx / TILE_K < M && (kt + TILE_K) + idx % TILE_K < K;
 
         // start GMEM load for next iterations
-        float4 nextB = maskB ? __ldcg((float4*)&B[((kt + TILE_K) + idx / TILE_N) * N + (nt + idx % TILE_N)]) : zero;
-        float4 nextA = maskA ? __ldcg((float4*)&A[(mt + idx / TILE_K) * K + ((kt + TILE_K) + idx % TILE_K)]) : zero; // (m index) * K + (k index)
+        float4 nextB = maskB ? __ldg((float4*)&B[((kt + TILE_K) + idx / TILE_N) * N + (nt + idx % TILE_N)]) : zero;
+        float4 nextA = maskA ? __ldg((float4*)&A[(mt + idx / TILE_K) * K + ((kt + TILE_K) + idx % TILE_K)]) : zero; // (m index) * K + (k index)
 
 
         #pragma unroll 
         for (int k = 0; k < TILE_K; k++) {
             int kv = (k + 1) % TILE_K;
-            asm("" : "+r"(kv)); 
+            // asm("" : "+r"(kv)); 
 
             // Store next iterations GMEM load into SMEM
             if (k == 4){
@@ -98,7 +98,8 @@ __global__ void cutlass_gemm_final_kernel(const float* __restrict__ A, const flo
             }
             if (k == 7) {
                 // swap read and write buffers
-                __syncthreads(); // TODO: clear address registers, use padding, do ptr incrementing
+                // __syncthreads(); // TODO: clear address registers, ~~use padding~~, do ptr incrementing, threadblock swizzling, and tune hotloop, and add SMEM to fill registers in fewer instrs trick
+                asm volatile("bar.sync 0;" ::: "memory");   // aligned
                 read ^= 1; 
                 write ^= 1;
             }
@@ -125,12 +126,7 @@ __global__ void cutlass_gemm_final_kernel(const float* __restrict__ A, const flo
                     }
                 }
             }
-            
         }
-        
-        
-        
-
     }
     // write output to GMEM
     // TODO: try non vector stores too
@@ -141,7 +137,7 @@ __global__ void cutlass_gemm_final_kernel(const float* __restrict__ A, const flo
             int tile_coord_m = tile_offset_m + tile / 2 * WARP_TILE_M/2 + m;
             int tile_coord_n = tile_offset_n + tile % 2 * WARP_TILE_N/2;
             if (mt + tile_coord_m < M && nt + tile_coord_n < N) {
-                __stwb((float4*)&C[(mt + tile_coord_m) * N + (nt + tile_coord_n)], *(float4*)&output[tile][m]);
+                __stcs((float4*)&C[(mt + tile_coord_m) * N + (nt + tile_coord_n)], *(float4*)&output[tile][m]);
             }
         }
     }
