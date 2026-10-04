@@ -374,7 +374,7 @@ The full new tiling stategy:
 
 <br>
 </br>
-Heres how thread ids are mapped within an SMEM output tile:
+How thread ids are mapped within an SMEM output tile:
 
 <div align="center">
     <img src="diagrams/warp_ids.svg" width="600">
@@ -561,6 +561,7 @@ constexpr int TILE_M = 128; // block sizes along each dimension
 constexpr int TILE_N = TILE_M; 
 constexpr int TILE_K = 8; // small K and larger M and N boosts arithmetic intensity
 constexpr int FRAG_SIZE = 8;
+constexpr int SUB_FRAG_SIZE = FRAG_SIZE / 2;
 
 // for laying out warps within a block
 constexpr int WARP_PER_ROW = 2; // can be 2 or 4
@@ -578,14 +579,14 @@ __global__ void gemm_vectorized_kernel(const float* __restrict__ A, const float*
     int lane_id = tid % WARP_SIZE;
     
     // preprocess address calculations for SMEM -> reg and reg -> GMEM
-    int tile_offset_m = warp_id / WARP_PER_ROW * WARP_TILE_M + lane_id / T_PER_WTILE_ROW * FRAG_SIZE/2;
-    int tile_offset_n = warp_id % WARP_PER_ROW * WARP_TILE_N + lane_id % T_PER_WTILE_ROW * FRAG_SIZE/2;
+    int tile_offset_m = warp_id / WARP_PER_ROW * WARP_TILE_M + lane_id / T_PER_WTILE_ROW * SUB_FRAG_SIZE;
+    int tile_offset_n = warp_id % WARP_PER_ROW * WARP_TILE_N + lane_id % T_PER_WTILE_ROW * SUB_FRAG_SIZE;
     
     __shared__ __align__(16) float tileA[TILE_M * TILE_K]; // 128 x 8
     __shared__ __align__(16) float tileB[TILE_K * TILE_N]; // 8 x 128
 
     
-    float __align__(16) output[NUM_TILES][FRAG_SIZE/2][FRAG_SIZE/2] = {0}; // if we stride our output tiles well be able to coalesce our store
+    float __align__(16) output[NUM_TILES][SUB_FRAG_SIZE][SUB_FRAG_SIZE] = {0}; // if we stride our output tiles well be able to coalesce our store
 
     
     int num_blks_n = (N + TILE_N - 1) / TILE_N;  
@@ -608,22 +609,22 @@ __global__ void gemm_vectorized_kernel(const float* __restrict__ A, const float*
 
             // Load from SMEM to registers
             #pragma unroll
-            for (int i = 0; i < FRAG_SIZE/2; i++) {
+            for (int i = 0; i < SUB_FRAG_SIZE; i++) {
                 fragA[i] = tileA[(tile_offset_m + i) * TILE_K + (k)];
-                fragA[i + FRAG_SIZE/2] = tileA[(tile_offset_m + i + WARP_TILE_M/2) * TILE_K + (k)];
+                fragA[i + SUB_FRAG_SIZE] = tileA[(tile_offset_m + i + WARP_TILE_M/2) * TILE_K + (k)];
 
             }
             *(float4*)&fragB[0] = *(float4*)&tileB[(k) * TILE_N + (tile_offset_n)];
-            *(float4*)&fragB[FRAG_SIZE/2] = *(float4*)&tileB[(k) * TILE_N + (tile_offset_n + WARP_TILE_N/2)];
+            *(float4*)&fragB[SUB_FRAG_SIZE] = *(float4*)&tileB[(k) * TILE_N + (tile_offset_n + WARP_TILE_N/2)];
 
             // compute outer product (matmul for our two fragments)
             #pragma unroll
             for (int tile = 0; tile < NUM_TILES; tile++) {
                 #pragma unroll
-                for (int m = 0; m < FRAG_SIZE/2; m++) {
+                for (int m = 0; m < SUB_FRAG_SIZE; m++) {
                     #pragma unroll
-                    for (int n = 0; n < FRAG_SIZE/2; n++) {
-                        output[tile][m][n] += fragA[tile / 2 * FRAG_SIZE/2 + m] * fragB[tile % 2 * FRAG_SIZE/2 + n];
+                    for (int n = 0; n < SUB_FRAG_SIZE; n++) {
+                        output[tile][m][n] += fragA[tile / 2 * SUB_FRAG_SIZE + m] * fragB[tile % 2 * SUB_FRAG_SIZE + n];
                     }
                 }
             }
@@ -635,7 +636,7 @@ __global__ void gemm_vectorized_kernel(const float* __restrict__ A, const float*
     #pragma unroll
     for (int tile = 0; tile < NUM_TILES; tile++) {    
         #pragma unroll
-        for (int m = 0; m < FRAG_SIZE/2; m++) {
+        for (int m = 0; m < SUB_FRAG_SIZE; m++) {
             int tile_coord_m = tile_offset_m + tile / 2 * WARP_TILE_M/2 + m;
             int tile_coord_n = tile_offset_n + tile % 2 * WARP_TILE_N/2;
             if (mt + tile_coord_m < M && nt + tile_coord_n < N) {
@@ -681,43 +682,33 @@ Looking at the warp state statistics section we can see that long scoreboard sta
 
 ## Transposed & Swizzled 
 
-For the double buffered kernel, nsight compute is flagging that our kernel is getting slowed down by a 4-way bank conflict. A bank conflict occurs when a memory access two different 32 bit words from the same bank in a single memory access. SMEM is partitioned into 32 banks where each bank is 4 bytes wide. Every consecutive 4 byte word maps into a consecutive bank until bank 31 where it wraps around to bank 0. When a conflict occurs the access gets split into multiple wavefronts issued one after the other. A wavefront is one pass through SMEM during which each bank can serve one of its 32 bit words. 
+For the double buffered kernel, nsight compute is flagging that our kernel is getting slowed down by a 4-way bank conflict. A bank conflict occurs when a memory access two different 32 bit words from the same bank in a single memory access. SMEM is partitioned into 32 banks where each bank is 4 bytes wide. Every consecutive 4 byte word is assigned to the 32 banks round rob. When a conflict occurs the access gets split into multiple wavefronts issued one after the other. A wavefront is one pass through SMEM during which each bank can serve one of its 32 bit words. 
 
-%% insert memory banks visualization here %%
+<div align="center">
+    <img src="diagrams/smem_bank_layout.svg" width="800">
+    <br>
+</div>
 
 A conflict-free memory access for float32s only issues one wavefront. However, for an n-way bank conflict (n unique words being accessed from a single bank in a single request) the memory access has to be issued as n wavefronts.
 
-%% insert no-conflict visual & 4-way bank conflict %% 
+%% insert no-conflict visual & basic 4-way bank conflict %% 
 
 The worst case scenario for accessing SMEM in this layout would be if a warp issued a memory access where all the lanes access along a column in an array where the row stride is 32 or a multiple of 32. In this scenario, a 32-way bank conflict is created and the memory access issues 32 wavefronts with each wavefront only accessing 1 element. 
 
-If we map out our access pattern for the A tile we can see exactly why 
+%% insert 32 way bank conflict visual %%
 
-To fix this, something would have to change something about the way that our data is distributed to banks such that when its accessed different lanes access different banks. SMEM address swizzling is an optimization that does exactly this. When we swizzle SMEM addresses we are modifying our 2D->1D address calculation function ((x, y) -> x * Y + y) to apply a reversible shuffle to the real address that the value is stored at. A typical SMEM swizzle for 32-bit values looks modifying the address calculation function to: (x, y) -> x * Y + y ^ x. This shuffles all of the columns of the function depending on according to a xo
+You might be wondering how using vectorized SMEM accesses interacts with the SMEM banks. Vectorization does not necessarily cause bank conflicts but it can cause memory accesses to get issued as multiple wavefronts. If a warp were to issue a vectorized memory access for 32 consecutive 128-bit vectors with each vector being 4 words wide and spanning across 4 consecutive banks, this single memory access would require 4 wavefronts. The access is still conflict-free but because each of the 32 SMEM banks can only serve one 32-bit word at a time it gets sent as 4 wavefronts with each wavefront handling 8 lanes worth of data.
 
-%%/w add section about why vectorization doesnt cause bank conflicts %% 
+Now we can infer the source of the bank conflicts by looking at the SMEM access patterns for the double buffered kernel. For tile B since the access pattern is always consecutive lanes accessing consecutive values so we know accesses to it remains conflict free. However, if we map out our access pattern for the A tile we can see exactly why it gets a 4 way conflict. %% cont %%
 
-%%
-SMEM Layout
-    Bank conflict mechanism - 32 banks × 4 B, serialization, broadcast
-    fragA is 4-way conflicted (64×/k-tile); cause is [TILE_M][TILE_K] stride 8
-    Transpose → loads clean, fragA vectorizes; conflict relocates to the 4 scalar stores
-    Swizzle → stores clean
-    Conflict counter chart (before / transposed / swizzled) + benchmark rows
-%%
+%% insert actual tile A 4-way bank conflict %% 
+
+We can address bank conflicts by shuffling our values address as we store it to SMEM such that our access pattern no longer demands multiple values for the same bank. SMEM address swizzling is an optimization that does exactly this. When we swizzle SMEM addresses we are modifying our 2D->1D address calculation function, `(x, y) -> y * X + x`, to apply a reversible shuffle to the real address that the value is stored at. A typical SMEM swizzle for 32-bit values looks modifying the address calculation function to: `(x, y) -> y * X + x ^ y`. This is called a XOR swizzle and it shuffles all of the columns of the by XORing it with the row idx. 
+
+
+Vectorization also changes how the swizzle function that we use. Because vectorized accesses need hardware alignment and elements within a vector to not get shuffled out of the vector, we have to modify the swizzle function so that it shuffles 128-bit vectors instead of shuffling scalar 32-bit floats. Implementing this is quite simple: we just divide the col idx by the vector size before swizzling. In our case it becomes `(x, y) -> y * X + (x / 4) ^ y`. When we divide by the vector size we are converting our column idx from answering where is this scalar value located to answering which vector is this scalar in. This makes the swizzle function shuffle vectors instead of .
+
+%% insert visualization for how vectorization changes swizzling and bank conflicts %%
+
+
 ## Results
-%% TODO: 
-    - add align for all of the vectorized kernels
-    - explain why its padded and how you would implement it if it wasnt
-    - investigate if swizzle is possible for accesses on row size 8, might be possible if (x, y) gets linearized first and then swizzled, might be able to get rid of transposed???
-    - fix vectorized comment
-    - address address calculation function?
-    - investigate higher clock speeds
-    - Change FRAG_SIZE to SUB_FRAG_SIZE = FRAG_SIZE / 2
-    - Explain why tile A isnt vectorized in vectorized writeup
-    - Talk about why the GMEM -> SMEM line is split in double buffered
-    - Fix factual error with A load not being coalesced in vectorized because its not coalesceable with this layout
-    - remove __ldcg or replace with inline ptx, remove written section about it as well
-    - delete __stwb
-    - maybe rewrite 128B cache line section to be about 32B sectors
-%%

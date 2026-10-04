@@ -8,6 +8,7 @@ constexpr int TILE_M = 128; // block sizes along each dimension
 constexpr int TILE_N = TILE_M; 
 constexpr int TILE_K = 8; // small K and larger M and N boosts arithmetic intensity
 constexpr int FRAG_SIZE = 8;
+constexpr int SUB_FRAG_SIZE = FRAG_SIZE / 2;
 
 // for laying out warps within a block
 constexpr int WARP_PER_ROW = 2; // can be 2 or 4
@@ -26,14 +27,14 @@ __global__ void gemm_vectorized_kernel(const float* __restrict__ A, const float*
     int lane_id = tid % WARP_SIZE;
     
     // preprocess address calculations for SMEM -> reg and reg -> GMEM
-    int tile_offset_m = warp_id / WARP_PER_ROW * WARP_TILE_M + lane_id / T_PER_WTILE_ROW * FRAG_SIZE/2;
-    int tile_offset_n = warp_id % WARP_PER_ROW * WARP_TILE_N + lane_id % T_PER_WTILE_ROW * FRAG_SIZE/2;
+    int tile_offset_m = warp_id / WARP_PER_ROW * WARP_TILE_M + lane_id / T_PER_WTILE_ROW * SUB_FRAG_SIZE;
+    int tile_offset_n = warp_id % WARP_PER_ROW * WARP_TILE_N + lane_id % T_PER_WTILE_ROW * SUB_FRAG_SIZE;
     
     __shared__ __align__(16) float tileA[TILE_M * TILE_K]; // 128 x 8
     __shared__ __align__(16) float tileB[TILE_K * TILE_N]; // 8 x 128
 
     
-    float __align__(16) output[NUM_TILES][FRAG_SIZE/2][FRAG_SIZE/2] = {0}; // if we stride our output tiles well be able to coalesce our store
+    float __align__(16) output[NUM_TILES][SUB_FRAG_SIZE][SUB_FRAG_SIZE] = {0}; // if we stride our output tiles well be able to coalesce our store
 
     
     int num_blks_n = (N + TILE_N - 1) / TILE_N;  
@@ -60,22 +61,22 @@ __global__ void gemm_vectorized_kernel(const float* __restrict__ A, const float*
 
             // Load from SMEM to registers
             #pragma unroll
-            for (int i = 0; i < FRAG_SIZE/2; i++) {
+            for (int i = 0; i < SUB_FRAG_SIZE; i++) {
                 fragA[i] = tileA[(tile_offset_m + i) * TILE_K + (k)];
-                fragA[i + FRAG_SIZE/2] = tileA[(tile_offset_m + i + WARP_TILE_M/2) * TILE_K + (k)];
+                fragA[i + SUB_FRAG_SIZE] = tileA[(tile_offset_m + i + WARP_TILE_M/2) * TILE_K + (k)];
 
             }
             *(float4*)&fragB[0] = *(float4*)&tileB[(k) * TILE_N + (tile_offset_n)];
-            *(float4*)&fragB[FRAG_SIZE/2] = *(float4*)&tileB[(k) * TILE_N + (tile_offset_n + WARP_TILE_N/2)]; // ?? just update i to go to 8
+            *(float4*)&fragB[SUB_FRAG_SIZE] = *(float4*)&tileB[(k) * TILE_N + (tile_offset_n + WARP_TILE_N/2)]; // ?? just update i to go to 8
 
             // compute outer product (matmul for our two fragments)
             #pragma unroll
             for (int tile = 0; tile < NUM_TILES; tile++) {
                 #pragma unroll
-                for (int m = 0; m < FRAG_SIZE/2; m++) {
+                for (int m = 0; m < SUB_FRAG_SIZE; m++) {
                     #pragma unroll
-                    for (int n = 0; n < FRAG_SIZE/2; n++) {
-                        output[tile][m][n] += fragA[tile / 2 * FRAG_SIZE/2 + m] * fragB[tile % 2 * FRAG_SIZE/2 + n];
+                    for (int n = 0; n < SUB_FRAG_SIZE; n++) {
+                        output[tile][m][n] += fragA[tile / 2 * SUB_FRAG_SIZE + m] * fragB[tile % 2 * SUB_FRAG_SIZE + n];
                     }
                 }
             }
@@ -87,7 +88,7 @@ __global__ void gemm_vectorized_kernel(const float* __restrict__ A, const float*
     #pragma unroll
     for (int tile = 0; tile < NUM_TILES; tile++) {
         #pragma unroll
-        for (int m = 0; m < FRAG_SIZE/2; m++) {
+        for (int m = 0; m < SUB_FRAG_SIZE; m++) {
             int tile_coord_m = tile_offset_m + tile / 2 * WARP_TILE_M/2 + m;
             int tile_coord_n = tile_offset_n + tile % 2 * WARP_TILE_N/2;
             if (mt + tile_coord_m < M && nt + tile_coord_n < N) {
